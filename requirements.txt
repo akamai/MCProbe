@@ -1,0 +1,21 @@
+# MCProbe — dependencies
+
+# ── Core (required for all modes) ───────────────────────────────────────────
+langgraph>=0.2.0
+gitpython>=3.1.40
+python-dotenv>=1.0.0
+typing_extensions>=4.9.0
+
+# ── Static analyzers ────────────────────────────────────────────────────────
+bandit>=1.7.8
+semgrep>=1.60.0
+networkx>=3.2
+matplotlib>=3.8
+
+# ── AI backends (optional — only needed for AI review) ──────────────────────
+anthropic>=0.25.0
+openai>=1.30.0
+
+# ── GUI only (not needed for CLI or headless use) ────────────────────────────
+customtkinter>=5.2.0
+Pillow>=10.0.0
