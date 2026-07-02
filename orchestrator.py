@@ -7,7 +7,7 @@ import threading
 from typing import Optional, Dict as TypingDict, List
 
 from typing_extensions import TypedDict
-from helpers import dprint, extract_files_from_report, estimate_prompt_chars_from_folder
+from helpers import dprint, extract_files_from_report, estimate_prompt_chars_from_folder, usage_tokens
 
 
 def _silence_sdk_loggers():
@@ -126,6 +126,11 @@ class State(TypedDict):
     ai_backend: str             # "claude", "openai", or "claude-agent"
     ai_model: str               # model name override (empty = use default)
     calc_cost: bool             # dry-run: measure prompt size, skip API call
+    ai_only: bool               # --ai-only: analyzers skipped, don't announce them
+    tokens_in: int              # cumulative AI input tokens (review + validation)
+    tokens_out: int             # cumulative AI output tokens (review + validation)
+    validate_tokens_in: int     # input tokens used by the validation pass only
+    validate_tokens_out: int    # output tokens used by the validation pass only
     prompt_chars: int           # char count of AI prompt (set by calc_cost mode)
     validate: bool              # --validate flag
     cost_threshold: float       # --cost-threshold (default 5.0, -1 = no limit)
@@ -206,7 +211,8 @@ def detect_language_node(state: State) -> State:
 
 def analyze_repo_code(state: State) -> State:
     if not state.get("enabled_modules", {}).get("cfg", True):
-        dprint("[CFG] Module disabled — skipping")
+        if not state.get("ai_only"):
+            dprint("[CFG] Module disabled — skipping")
         return state
     dprint("[CFG] Running MCP flow analyzer")
     from analyzers.code_analyzer import analyze_repo_path
@@ -228,7 +234,8 @@ def analyze_repo_code(state: State) -> State:
 
 def analyze_repo_network(state: State) -> State:
     if not state.get("enabled_modules", {}).get("network", True):
-        dprint("[NET] Module disabled — skipping")
+        if not state.get("ai_only"):
+            dprint("[NET] Module disabled — skipping")
         return state
     dprint("[NET] Running network analyzer")
     from analyzers.network_analysis import analyze_network
@@ -250,7 +257,8 @@ def analyze_repo_network(state: State) -> State:
 
 def analyze_repo_sse(state: State) -> State:
     if not state.get("enabled_modules", {}).get("sse", True):
-        dprint("[SSE] Module disabled — skipping")
+        if not state.get("ai_only"):
+            dprint("[SSE] Module disabled — skipping")
         return state
     dprint("[SSE] Running SSE/streaming communication analyzer")
     from analyzers.sse_analyzer import analyze_sse
@@ -275,7 +283,8 @@ def analyze_repo_sse(state: State) -> State:
 
 def analyze_repo_auth(state: State) -> State:
     if not state.get("enabled_modules", {}).get("auth", True):
-        dprint("[AUTH] Module disabled — skipping")
+        if not state.get("ai_only"):
+            dprint("[AUTH] Module disabled — skipping")
         return state
     dprint("[AUTH] Running authentication & authorization analyzer")
     from analyzers.auth_analyzer import analyze_auth
@@ -300,7 +309,8 @@ def analyze_repo_auth(state: State) -> State:
 
 def analyze_repo_bandit(state: State) -> State:
     if not state.get("enabled_modules", {}).get("static", True):
-        dprint("[STATIC] Module disabled — skipping Bandit")
+        if not state.get("ai_only"):
+            dprint("[STATIC] Module disabled — skipping Bandit")
         return state
     dprint("[STATIC] Running Bandit static analyzer")
     from analyzers.bandit_analyzer import analyze_with_bandit
@@ -327,7 +337,8 @@ def analyze_repo_bandit(state: State) -> State:
 
 def analyze_repo_semgrep(state: State) -> State:
     if not state.get("enabled_modules", {}).get("static", True):
-        dprint("[STATIC] Module disabled — skipping Semgrep")
+        if not state.get("ai_only"):
+            dprint("[STATIC] Module disabled — skipping Semgrep")
         return state
     dprint("[STATIC] Running Semgrep static analyzer")
     from analyzers.semgrep_analyzer import analyze_js_repo
@@ -531,6 +542,9 @@ Rules:
                 messages=[{"role": "user", "content": prompt}],
             )
             ai_output = message.content[0].text.strip()
+            _ti, _to = usage_tokens(getattr(message, "usage", None))
+            state["tokens_in"] = state.get("tokens_in", 0) + _ti
+            state["tokens_out"] = state.get("tokens_out", 0) + _to
         except Exception as e:
             ai_output = f'{{"summary":"Claude analysis failed: {type(e).__name__}","findings":[]}}'
 
@@ -554,6 +568,9 @@ Rules:
                 temperature=0.2,
             )
             ai_output = (response.choices[0].message.content or "").strip()
+            _ti, _to = usage_tokens(getattr(response, "usage", None))
+            state["tokens_in"] = state.get("tokens_in", 0) + _ti
+            state["tokens_out"] = state.get("tokens_out", 0) + _to
         except Exception as e:
             ai_output = f'{{"summary":"OpenAI analysis failed: {type(e).__name__}","findings":[]}}'
 
@@ -710,6 +727,11 @@ def _default_state_extras() -> dict:
         "ai_backend": os.getenv("MCPROBE_AI_BACKEND", "claude"),
         "ai_model": "",
         "calc_cost": False,
+        "ai_only": False,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "validate_tokens_in": 0,
+        "validate_tokens_out": 0,
         "prompt_chars": 0,
         "validate": True,
         "cost_threshold": 5.0,

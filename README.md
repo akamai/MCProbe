@@ -53,7 +53,7 @@ AI backend:
   --use-os-env          Also read API keys/URLs from OS environment variables (by default only .env file is used)
   --calc-cost           Dry run: scan repos with all analyzers and estimate AI cost without calling the AI API
   --no-validate         Skip AI validation of findings (validation runs by default)
-  --cost-threshold $    Auto-confirm validation if cost is below threshold in USD (default: 5.0; use -1 to run without asking)
+  --cost-threshold $    Auto-confirm validation if the TOTAL estimated validation cost across all repos is below this threshold in USD (default: 5.0; use -1 to run without asking)
 
 output:
   --output DIR          Base output directory (default: ./out)

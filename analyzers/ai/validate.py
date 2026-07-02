@@ -18,7 +18,7 @@ from dotenv import dotenv_values
 import helpers as _helpers
 from helpers import (
     MODEL_PRICING, MAX_OUTPUT_TOKENS, estimate_tokens,
-    parse_ai_findings,
+    parse_ai_findings, usage_tokens,
 )
 
 
@@ -482,6 +482,11 @@ def run_validate(state: dict, **kwargs) -> dict:
                 messages=[{"role": "user", "content": user_prompt}],
             )
             raw_response = message.content[0].text.strip()
+            _ti, _to = usage_tokens(getattr(message, "usage", None))
+            state["tokens_in"] = state.get("tokens_in", 0) + _ti
+            state["tokens_out"] = state.get("tokens_out", 0) + _to
+            state["validate_tokens_in"] = _ti
+            state["validate_tokens_out"] = _to
         except Exception as e:
             _helpers.dprint(f"[VALIDATE] Claude call failed: {e}")
             return state
@@ -505,6 +510,11 @@ def run_validate(state: dict, **kwargs) -> dict:
                 temperature=0.2,
             )
             raw_response = (resp.choices[0].message.content or "").strip()
+            _ti, _to = usage_tokens(getattr(resp, "usage", None))
+            state["tokens_in"] = state.get("tokens_in", 0) + _ti
+            state["tokens_out"] = state.get("tokens_out", 0) + _to
+            state["validate_tokens_in"] = _ti
+            state["validate_tokens_out"] = _to
         except Exception as e:
             _helpers.dprint(f"[VALIDATE] OpenAI call failed: {e}")
             return state

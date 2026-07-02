@@ -21,7 +21,8 @@ from dotenv import dotenv_values
 
 from orchestrator import build_app, extract_repo_name, _default_state_extras
 from helpers import (parse_ai_findings, generate_html_report, print_cost_summary,
-                     estimate_prompt_chars_from_folder, estimate_tokens, MAX_OUTPUT_TOKENS)
+                     estimate_prompt_chars_from_folder, estimate_tokens, MAX_OUTPUT_TOKENS,
+                     MODEL_PRICING)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE = os.path.join(_PROJECT_ROOT, ".env")
@@ -116,6 +117,7 @@ def _build_initial_state(repo_url: str, repo_name: str, args, api_config: dict) 
     extras["openai_base_url"]    = api_config["openai_base_url"]
     extras["_env_file"]          = api_config.get("_env_file", "")
     extras["calc_cost"]          = getattr(args, "calc_cost", False)
+    extras["ai_only"]            = getattr(args, "ai_only", False)
     extras["validate"]           = not getattr(args, "no_validate", False)
     extras["cost_threshold"]     = getattr(args, "cost_threshold", 5.0)
     extras["module_timeout"]     = getattr(args, "timeout", 0) or 0
@@ -211,7 +213,7 @@ class _ValidationProgress:
         print(bar, flush=True)
 
 
-def _run_threaded_validation(ok_results: list, per_repo_costs: list,
+def _run_threaded_validation(ok_results: list,
                              num_threads: int, run_validate) -> None:
     """
     Run validation across multiple worker threads, streaming a per-thread
@@ -223,7 +225,6 @@ def _run_threaded_validation(ok_results: list, per_repo_costs: list,
     for r in ok_results:
         work_q.put(r)
 
-    cost_by_name = {n: c for n, c in per_repo_costs}
     workers = min(num_threads, len(ok_results))
     out_lock = threading.Lock()
 
@@ -240,9 +241,8 @@ def _run_threaded_validation(ok_results: list, per_repo_costs: list,
                 return
 
             name = r.get("name", "?")
-            cost = cost_by_name.get(name, 0.0)
             with out_lock:
-                print(f"  Thread {thread_id}/{workers} - working - {name} - ${cost:.4f}")
+                print(f"  Thread {thread_id}/{workers} - working - {name}")
 
             try:
                 run_validate(r)
@@ -250,8 +250,11 @@ def _run_threaded_validation(ok_results: list, per_repo_costs: list,
                 with out_lock:
                     print(f"  {name} - Validation Failed: {e}")
             else:
+                ti = r.get("validate_tokens_in", 0)
+                to = r.get("validate_tokens_out", 0)
                 with out_lock:
-                    print(f"  {name} - Validation Done")
+                    print(f"  {name} - Validation Done "
+                          f"(sent {ti:,} / recv {to:,} tokens)")
 
     threads = [threading.Thread(target=_worker, args=(i + 1,), daemon=True)
                for i in range(workers)]
@@ -860,7 +863,8 @@ def main():
     ai.add_argument("--no-validate", action="store_true",
                     help="Skip AI validation of findings (validation runs by default)")
     ai.add_argument("--cost-threshold", type=float, default=5.0, metavar="$",
-                    help="Auto-confirm validation if cost is below threshold in USD "
+                    help="Auto-confirm validation if the TOTAL estimated validation "
+                         "cost across all repos is below this threshold in USD "
                          "(default: 5.0; use -1 to run without asking)")
 
     # ── Output ──
@@ -923,6 +927,10 @@ def main():
         default_model = "claude-sonnet-4-6" if args.backend in ("claude", "claude-agent") else "gpt-4o-mini"
         model_name = args.model or api_config.get("ai_model") or default_model
         print(f"[MCPROBE] Using model: {model_name}")
+        if model_name not in MODEL_PRICING:
+            print(f"[MCPROBE] ⚠ No pricing table entry for '{model_name}' — "
+                  f"cost estimates will show $0. Add it to MODEL_PRICING in helpers.py "
+                  f"for accurate cost/threshold behaviour.")
 
     want_validate = not getattr(args, "no_validate", False) and not offline
     do_validate = want_validate and not args.calc_cost
@@ -1043,7 +1051,24 @@ def main():
         total_v_cost = sum(c for _, c in per_repo)
 
         threshold = getattr(args, "cost_threshold", 5.0)
-        if threshold != -1 and total_v_cost >= threshold:
+        priced = _model in MODEL_PRICING
+        if not priced:
+            # Can't estimate cost, so the threshold is meaningless — never
+            # silently auto-run. Ask, unless the user opted out with -1.
+            print(f"\n[MCProbe] Cannot estimate validation cost — no pricing for "
+                  f"model '{_model}'.")
+            if threshold == -1:
+                print("[MCProbe] --cost-threshold -1 set — running validation "
+                      "without asking.")
+            else:
+                try:
+                    ans = input(f"[MCProbe] Run validation on {len(ok_results)} "
+                                f"repo(s) anyway? [y/n]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    _safe_exit(0)
+                if ans != "y":
+                    do_validate = False
+        elif threshold != -1 and total_v_cost >= threshold:
             print(f"\n[MCProbe] Estimated validation cost:")
             for name, cost in per_repo:
                 print(f"  {name}: ${cost:.4f}")
@@ -1066,7 +1091,7 @@ def main():
             try:
                 if num_threads > 1 and len(ok_results) > 1:
                     _run_threaded_validation(
-                        ok_results, per_repo, num_threads, run_validate)
+                        ok_results, num_threads, run_validate)
                 else:
                     show_bar = sys.stdout.isatty()
                     total = len(ok_results)
@@ -1102,6 +1127,12 @@ def main():
         else:
             _print_ai_single(results[0])
         _print_reports(results)
+
+    tok_in = sum(r.get("tokens_in", 0) for r in results if "_error" not in r)
+    tok_out = sum(r.get("tokens_out", 0) for r in results if "_error" not in r)
+    if tok_in or tok_out:
+        print(f"\n[MCPROBE] Tokens — sent: {tok_in:,}  received: {tok_out:,}  "
+              f"(total: {tok_in + tok_out:,})")
 
     _prompt_open_folder(results, args)
 

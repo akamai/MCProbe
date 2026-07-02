@@ -14,7 +14,7 @@ import fnmatch
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from helpers import EXCLUDE_DIRS, should_skip_path, dprint
+from helpers import EXCLUDE_DIRS, should_skip_path, dprint, usage_tokens
 
 # ---------------------------------------------------------------------------
 # Safety / cost limits
@@ -589,6 +589,10 @@ def run_agent_scan(state: dict) -> Tuple[str, int]:
         except Exception as e:
             dprint(f"[AGENT] API error on iteration {iterations + 1}: {e}")
             raise
+
+        _ti, _to = usage_tokens(getattr(resp, "usage", None))
+        state["tokens_in"] = state.get("tokens_in", 0) + _ti
+        state["tokens_out"] = state.get("tokens_out", 0) + _to
 
         iterations += 1
         dprint(f"[AGENT] Iteration {iterations}/{MAX_ITERATIONS} — "

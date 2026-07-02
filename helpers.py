@@ -242,8 +242,9 @@ def generate_html_report(state: dict) -> str:
 
 MODEL_PRICING = {
     # Anthropic
-    "claude-opus-4-6":            (15.00, 75.00),
+    "claude-opus-4-8":            (15.00, 75.00),
     "claude-opus-4-7":            (15.00, 75.00),
+    "claude-opus-4-6":            (15.00, 75.00),
     "claude-sonnet-4-6":          (3.00,  15.00),
     "claude-haiku-4-5-20251001":  (0.80,  4.00),
     # OpenAI
@@ -262,6 +263,26 @@ MAX_OUTPUT_TOKENS = 4096
 
 def estimate_tokens(chars: int) -> int:
     return max(1, int(chars / 3.5))
+
+
+def usage_tokens(usage) -> tuple:
+    """Extract (input_tokens, output_tokens) from an API usage object.
+
+    Anthropic reports input_tokens/output_tokens; OpenAI reports
+    prompt_tokens/completion_tokens. Returns (0, 0) when unavailable.
+    """
+    if usage is None:
+        return 0, 0
+    inp = getattr(usage, "input_tokens", None)
+    if inp is None:
+        inp = getattr(usage, "prompt_tokens", 0)
+    out = getattr(usage, "output_tokens", None)
+    if out is None:
+        out = getattr(usage, "completion_tokens", 0)
+    try:
+        return int(inp or 0), int(out or 0)
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 def print_cost_summary(results: list, model_name: str, validate: bool = False):
