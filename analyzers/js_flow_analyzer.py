@@ -610,11 +610,103 @@ def _extract_callback(
 # MCP tool registration detection
 # ---------------------------------------------------------------------------
 
-# Matches any .tool( call: server.tool(, this.tool(, mcpServer.tool(
-# Does NOT require a string literal — handles variable names too
-_TOOL_CALL_RE = re.compile(
-    r'(?:\bthis|\b\w+)\s*\.\s*tool\s*\('
-)
+# Matches a tool-registration method reference: server.tool, this.tool,
+# mcpServer.tool, server.registerTool, ...  The opening '(' may be separated
+# from it by a TS cast (`(server.tool as any)(`) or a generic (`server.tool<T>(`),
+# so the actual call paren is located separately by _iter_tool_call_opens.
+_TOOL_REF_RE = re.compile(r'(?:\bthis|\b\w+)\s*\.\s*(?:tool|registerTool)(?!\w)')
+
+
+def _match_paren(prepared: str, after_open: int) -> int:
+    """Given the index just past an opening '(', return the index of the
+    matching ')' (or end of string)."""
+    depth, i, n = 1, after_open, len(prepared)
+    while i < n and depth > 0:
+        c = prepared[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        i += 1
+    return i - 1
+
+
+def _iter_tool_call_opens(stripped: str, prepared: str):
+    """Yield the index just past the opening '(' of each tool-registration
+    call: server.tool(...), server.registerTool(...), and cast/generic forms
+    like (server.tool as any)(...) or server.tool<T>(...)."""
+    n = len(prepared)
+    for m in _TOOL_REF_RE.finditer(stripped):
+        k = m.end()
+        limit = min(n, k + 64)
+        while k < limit:
+            c = prepared[k]
+            if c == '(':
+                yield k + 1
+                break
+            if c in ' \t\r\n)':                 # whitespace / cast-closing ')'
+                k += 1
+            elif prepared.startswith('as ', k):  # TS cast, e.g. `as any`
+                k += 3
+            elif c == '<':                       # generic <...> (bounded)
+                depth, k = 1, k + 1
+                while k < limit and depth > 0:
+                    if prepared[k] == '<':
+                        depth += 1
+                    elif prepared[k] == '>':
+                        depth -= 1
+                    k += 1
+            elif c.isalnum() or c == '_':        # cast type name (any, unknown…)
+                k += 1
+            else:
+                break                            # not a call — give up
+
+
+def _split_top_level_args(region: str):
+    """Split a call's argument region into (start, end) spans at top-level
+    commas (ignoring commas nested in (), [], {})."""
+    spans, depth, start = [], 0, 0
+    for i, c in enumerate(region):
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            spans.append((start, i))
+            start = i + 1
+    spans.append((start, len(region)))
+    return spans
+
+
+def _resolve_named_handler(stripped: str, prepared: str, after_open: int):
+    """When a tool's handler is passed by name instead of inline, look for
+    that handler's definition in the same file so we can still trace it.
+    Returns (body, params, line_start, line_end) or None."""
+    close = _match_paren(prepared, after_open)
+    spans = _split_top_level_args(prepared[after_open:close])
+    if not spans:
+        return None
+    s, e = spans[-1]
+    last = stripped[after_open + s:after_open + e].strip()
+    if not re.fullmatch(r'[A-Za-z_$][\w$]*', last):
+        return None
+    defre = re.compile(
+        r'(?:function\s+' + re.escape(last) + r'\s*\(([^)]*)\)'
+        r'|(?:const|let|var)\s+' + re.escape(last) +
+        r'\s*=\s*(?:async\s*)?(?:function\s*\*?\s*)?\(([^)]*)\)\s*(?:=>)?)'
+    )
+    dm = defre.search(prepared)
+    if not dm:
+        return None
+    brace = prepared.find('{', dm.end() - 1)
+    if brace == -1:
+        return None
+    cbrace = _find_matching_brace(prepared, brace)
+    params_src = dm.group(1) if dm.group(1) is not None else (dm.group(2) or "")
+    params = _extract_js_params(params_src)
+    body = stripped[brace + 1:cbrace]
+    return (body, params,
+            stripped[:brace].count('\n') + 1, stripped[:cbrace].count('\n') + 1)
 
 # Matches: setRequestHandler(CallToolRequestSchema,
 _HANDLER_RE = re.compile(
@@ -631,9 +723,7 @@ def _find_mcp_tool_records(
 ) -> List[FunctionRecord]:
     records: List[FunctionRecord] = []
 
-    for m in _TOOL_CALL_RE.finditer(stripped):
-        after_open = m.end()  # position right after the opening (
-
+    for after_open in _iter_tool_call_opens(stripped, prepared):
         # Peek at first non-whitespace character to detect arg style
         peek = stripped[after_open:after_open + 300].lstrip()
 
@@ -677,7 +767,13 @@ def _find_mcp_tool_records(
             result = _extract_callback(stripped, prepared, after_open)
 
         if result is None:
-            continue
+            # No inline callback — the handler is passed by name/reference.
+            result = _resolve_named_handler(stripped, prepared, after_open)
+        if result is None:
+            # Couldn't resolve the handler; still register the tool (empty body)
+            # so the repo isn't mis-flagged as having no MCP tools.
+            call_line = stripped[:after_open].count('\n') + 1
+            result = ("", [ParamInfo(name="args")], call_line, call_line)
         body, params, line_start, line_end = result
         if not params:
             params = [ParamInfo(name="args")]
@@ -836,11 +932,21 @@ def _find_named_function_records(
 # Per-file indexer
 # ---------------------------------------------------------------------------
 
+_MAX_JS_FILE_BYTES = 1_500_000   # skip files larger than ~1.5 MB
+_MINIFIED_AVG_LINE = 2000        # skip files whose avg line length looks minified
+
+
 def _index_js_file(filepath: str) -> List[FunctionRecord]:
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             source = f.read()
     except Exception:
+        return []
+
+    # Skip minified / bundled / generated files: they are not hand-written MCP
+    # tool registrations and their huge single lines make regex analysis hang.
+    if len(source) > _MAX_JS_FILE_BYTES or \
+            len(source) / (source.count('\n') + 1) > _MINIFIED_AVG_LINE:
         return []
 
     stripped = _strip_js_comments(source)
