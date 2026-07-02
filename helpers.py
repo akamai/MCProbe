@@ -237,6 +237,306 @@ def generate_html_report(state: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Batch results dashboard (interactive HTML) — shared by the CLI and the
+# standalone tools/results_to_html.py generator.
+# ---------------------------------------------------------------------------
+
+_BATCH_SNIPPET_CONTEXT = 8
+
+
+def read_source_snippet(repo_root: str, file: str, line, context: int = _BATCH_SNIPPET_CONTEXT):
+    """Return [{"n": lineno, "text": str}, ...] around `line` in
+    repo_root/file, or None if the file can't be read."""
+    if not repo_root or not file or not line:
+        return None
+    try:
+        path = os.path.join(repo_root, *str(file).split("/"))
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            src = f.read().splitlines()
+    except Exception:
+        return None
+    line = int(line)
+    lo = max(1, line - context)
+    hi = min(len(src), line + context)
+    return [{"n": i, "text": src[i - 1]} for i in range(lo, hi + 1)]
+
+
+def next_results_html_path(analyses_dir: str, stem: str = "results") -> str:
+    """Return a new, non-colliding versioned path:
+    <analyses_dir>/00_<stem>.html, then 01_, 02_, ...  The zero-padded numeric
+    prefix keeps the dashboards sorted at the top of the folder, and never
+    overwrites a previous run's dashboard."""
+    os.makedirs(analyses_dir, exist_ok=True)
+    n = 0
+    while True:
+        cand = os.path.join(analyses_dir, f"{n:02d}_{stem}.html")
+        if not os.path.exists(cand):
+            return cand
+        n += 1
+
+
+# The renderer expects a payload with precomputed hrefs so it is agnostic to
+# where the HTML file lives:
+#   payload = {
+#     "meta": {total, errors, with_findings, sev_counts:{SEV:int}},
+#     "repos": [{name, lang, ai(bool), error, high, total, stats, report_href,
+#                findings:[{sev, source, title, location, file, line, description,
+#                           verdict, orig_sev, snippet, src_href, github_href}]}]
+#   }
+_BATCH_HTML = r"""<!DOCTYPE html>
+<html lang="en" data-theme="light"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCProbe — Batch Results</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#0d1117; --border:#30363d;
+    --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --row:#161b22;
+    --chip:#21262d; --hl:rgba(210,153,34,.28);
+  }
+  [data-theme="light"] {
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#f6f8fa; --border:#d0d7de;
+    --text:#1f2328; --muted:#636c76; --accent:#0969da; --row:#ffffff;
+    --chip:#eaeef2; --hl:#fff8c5;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg);
+         color:var(--text); padding:20px; transition:background .15s,color .15s; }
+  h1 { color:var(--accent); font-size:22px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+           gap:10px; margin-bottom:16px; }
+  .stat { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+          padding:12px; text-align:center; }
+  .stat .num { font-size:26px; font-weight:700; }
+  .stat .lbl { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .controls { position:sticky; top:0; z-index:5; background:var(--bg);
+              border-bottom:1px solid var(--border); padding:10px 0 12px;
+              display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:14px; }
+  .group { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .group > .label { font-size:11px; color:var(--muted); text-transform:uppercase; margin-right:2px; }
+  button, .pill { cursor:pointer; border:1px solid var(--border); background:var(--chip);
+          color:var(--text); border-radius:20px; padding:5px 12px; font-size:12px; user-select:none; }
+  .pill.on { border-color:transparent; color:#fff; }
+  #search { border-radius:8px; padding:6px 10px; min-width:200px; }
+  .repo { background:var(--row); border:1px solid var(--border); border-radius:8px;
+          margin-bottom:8px; overflow:hidden; }
+  .repo-head { display:flex; align-items:center; gap:10px; padding:10px 12px; }
+  .repo-head input { width:16px; height:16px; cursor:pointer; }
+  .repo-name { font-weight:600; }
+  .repo-name a { color:var(--accent); text-decoration:none; }
+  .repo-meta { color:var(--muted); font-size:12px; display:flex; gap:8px; flex-wrap:wrap;
+               margin-left:auto; align-items:center; }
+  .tag { background:var(--chip); border-radius:10px; padding:1px 8px; font-size:11px; }
+  .tag.err { background:#d6303122; color:#ff7b72; }
+  .findings { padding:2px 12px 10px 40px; }
+  .finding-wrap { border-top:1px solid var(--border); }
+  .finding-wrap:first-child { border-top:none; }
+  .finding { padding:7px 6px; cursor:pointer; border-radius:6px; }
+  .finding:hover { background:var(--chip); }
+  .finding .caret { color:var(--muted); font-size:10px; margin-right:6px; }
+  .sev { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; font-weight:700; margin-right:6px; }
+  .src { color:var(--muted); font-size:11px; margin-left:4px; }
+  .vd { font-size:10px; padding:0 6px; border-radius:4px; margin-left:6px; color:#fff; }
+  .vd-disc { background:#1f6feb; } .vd-rc { background:#bf8700; } .vd-ok { background:#238636; }
+  .loc { font-family:Consolas,monospace; font-size:12px; color:var(--muted); margin:3px 0 0 20px; }
+  .drawer { padding:2px 6px 10px 20px; }
+  .drawer.hidden { display:none; }
+  .desc { color:var(--muted); font-size:12px; margin:4px 0; }
+  pre.code { background:var(--panel2); border:1px solid var(--border); border-radius:6px;
+             padding:8px 0; overflow-x:auto; margin:6px 0; }
+  .cline { font-family:Consolas,monospace; font-size:12px; white-space:pre; padding:0 10px; }
+  .cline .ln { display:inline-block; width:40px; color:var(--muted); text-align:right; margin-right:14px; user-select:none; }
+  .cline.hl { background:var(--hl); }
+  .drawer-actions { display:flex; gap:14px; align-items:center; margin-top:8px; }
+  .fp-btn { font-size:11px; padding:3px 10px; border-radius:6px; }
+  .filelink { color:var(--accent); font-size:12px; text-decoration:none; }
+  .fp-badge { display:none; background:#8957e5; color:#fff; border-radius:4px; padding:0 6px; font-size:10px; font-weight:700; margin-right:6px; }
+  .finding-wrap.fp { border-left:3px solid #8957e5; }
+  .finding-wrap.fp .fp-badge { display:inline-block; }
+  .none { color:var(--muted); font-size:12px; padding:2px 0 6px 0; }
+  .hidden { display:none !important; }
+  .count { color:var(--muted); font-size:12px; }
+  .theme-fixed { position:fixed; top:12px; right:12px; z-index:50; }
+</style>
+</head><body>
+<button id="theme" class="theme-fixed">&#127769; Dark</button>
+<h1>MCProbe — Batch Results</h1>
+<div class="sub" id="subtitle"></div>
+<div class="stats" id="stats"></div>
+<div class="controls">
+  <div class="group"><span class="label">Severity</span><span id="sevPills"></span></div>
+  <div class="group">
+    <button id="selAll">All repos</button>
+    <button id="selNone">None</button>
+    <label class="pill"><input type="checkbox" id="hideEmpty" checked> Hide repos w/o shown findings</label>
+    <button id="clearFP">Clear FP marks</button>
+  </div>
+  <div class="group" style="margin-left:auto"><input id="search" placeholder="Filter repos by name…"></div>
+</div>
+<div class="count" id="visCount"></div>
+<div id="list"></div>
+<script>
+const DATA = __DATA__;
+const SEV_ORDER = ["CRITICAL","HIGH","MEDIUM","LOW","INFO"];
+const SEV_COLORS = {CRITICAL:"#d63031",HIGH:"#e17055",MEDIUM:"#fdcb6e",LOW:"#00b894",INFO:"#74b9ff"};
+const SEV_TEXT   = {CRITICAL:"#fff",HIGH:"#fff",MEDIUM:"#1a1a1a",LOW:"#1a1a1a",INFO:"#0a0a0a"};
+const active = new Set(["CRITICAL"]);
+function loadFP(){ try { return JSON.parse(localStorage.getItem("mcprobe-fp")||"[]"); } catch(e){ return []; } }
+function saveFP(){ try { localStorage.setItem("mcprobe-fp", JSON.stringify([...fpSet])); } catch(e){} }
+const fpSet = new Set(loadFP());
+const FKEY = {}; let _gid = 0;
+function keyOf(name, f){ return name + "|" + (f.file||"") + "|" + (f.line||"") + "|" + f.title; }
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function repoLink(r){
+  if(!r.report_href) return esc(r.name);
+  return `<a href="${esc(r.report_href)}" target="_blank" rel="noopener">${esc(r.name)}</a>`;
+}
+function verdictTag(f){
+  if(f.verdict==="discovered") return `<span class="vd vd-disc">discovered</span>`;
+  if(f.verdict==="severity_changed") return `<span class="vd vd-rc">reclassified${f.orig_sev?" from "+esc(f.orig_sev):""}</span>`;
+  if(f.verdict==="confirmed") return `<span class="vd vd-ok">confirmed</span>`;
+  return "";
+}
+function renderStats(){
+  const m = DATA.meta, c = m.sev_counts;
+  document.getElementById("subtitle").textContent =
+    `${m.total} repos analyzed · ${m.errors} errors · ${m.with_findings} with findings`;
+  const tiles = [["Repos",m.total],["Errors",m.errors],["Critical",c.CRITICAL],
+                 ["High",c.HIGH],["Medium",c.MEDIUM],["Low",c.LOW]];
+  document.getElementById("stats").innerHTML = tiles.map(([l,n]) =>
+    `<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
+}
+function renderPills(){
+  const box = document.getElementById("sevPills");
+  let html = SEV_ORDER.map(s => {
+    const on = active.has(s);
+    const style = on ? `background:${SEV_COLORS[s]};color:${SEV_TEXT[s]}` : "";
+    return `<span class="pill sev-pill ${on?"on":""}" data-sev="${s}" style="${style}">${s} (${DATA.meta.sev_counts[s]})</span>`;
+  }).join("");
+  const fpOn = active.has("FP");
+  html += `<span class="pill sev-pill ${fpOn?"on":""}" data-sev="FP" style="${fpOn?"background:#8957e5;color:#fff":""}">FP (${fpSet.size})</span>`;
+  box.innerHTML = html;
+  box.querySelectorAll(".sev-pill").forEach(p => p.onclick = () => {
+    const s = p.dataset.sev; active.has(s) ? active.delete(s) : active.add(s);
+    renderPills(); applyFilters();
+  });
+}
+function drawerHTML(r, f, gid){
+  const snip = (f.snippet||[]).map(s =>
+    `<div class="cline${s.n===f.line?" hl":""}"><span class="ln">${s.n}</span>${esc(s.text)}</div>`).join("");
+  const code = snip ? `<pre class="code">${snip}</pre>`
+             : (f.location ? `<div class="none">Source not available locally.</div>` : "");
+  const desc = f.description ? `<div class="desc">${esc(f.description)}</div>` : "";
+  const openFile = f.src_href ? `<a class="filelink" href="${esc(f.src_href)}" target="_blank" rel="noopener">Open full file &#8599;</a>` : "";
+  const gh = f.github_href ? `<a class="filelink" href="${esc(f.github_href)}" target="_blank" rel="noopener">GitHub &#8599;</a>` : "";
+  const actions = `<div class="drawer-actions"><button class="fp-btn" data-fid="${gid}">Mark as FP</button>${openFile}${gh}</div>`;
+  return `<div class="drawer hidden">${desc}${code}${actions}</div>`;
+}
+function renderList(){
+  _gid = 0;
+  document.getElementById("list").innerHTML = DATA.repos.map((r,i) => {
+    const findings = r.findings.map(f => {
+      const gid = _gid++; FKEY[gid] = keyOf(r.name, f);
+      return `
+      <div class="finding-wrap" data-sev="${f.sev}" data-fid="${gid}">
+        <div class="finding">
+          <span class="caret">&#9654;</span><span class="fp-badge">FP</span>
+          <span class="sev" style="background:${SEV_COLORS[f.sev]||"#999"};color:${SEV_TEXT[f.sev]||"#fff"}">${esc(f.sev)}</span>
+          <span>${esc(f.title)}</span><span class="src">[${esc(f.source)}]</span>${verdictTag(f)}
+          ${f.location?`<div class="loc">↳ ${esc(f.location)}</div>`:""}
+        </div>
+        ${drawerHTML(r, f, gid)}
+      </div>`;
+    }).join("");
+    const meta = [];
+    if(r.error){ meta.push(`<span class="tag err">ERROR</span>`); }
+    else {
+      meta.push(`<span class="tag">${esc(r.lang||"?")}</span>`);
+      if(r.high!=null) meta.push(`<span class="tag">${r.high} high / ${r.total} total</span>`);
+      if(r.stats) meta.push(`<span class="tag">${esc(r.stats)}</span>`);
+      meta.push(`<span class="tag">AI ${r.ai?"✓":"—"}</span>`);
+    }
+    return `
+    <div class="repo" data-idx="${i}" data-name="${esc(r.name.toLowerCase())}">
+      <div class="repo-head">
+        <input type="checkbox" class="repo-cb" checked data-idx="${i}">
+        <span class="repo-name">${repoLink(r)}</span>
+        <span class="repo-meta">${meta.join("")}</span>
+      </div>
+      <div class="findings">${findings || (r.error?`<div class="none">${esc(r.error)}</div>`:`<div class="none">No findings.</div>`)}</div>
+    </div>`;
+  }).join("");
+  document.querySelectorAll(".repo-cb").forEach(cb => cb.onchange = applyFilters);
+  document.querySelectorAll(".finding").forEach(el => el.onclick = () => {
+    const d = el.parentNode.querySelector(".drawer");
+    if(d) d.classList.toggle("hidden");
+    const caret = el.querySelector(".caret");
+    if(caret) caret.innerHTML = d && d.classList.contains("hidden") ? "&#9654;" : "&#9660;";
+  });
+  document.querySelectorAll(".fp-btn").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const key = FKEY[b.dataset.fid]; const wrap = b.closest(".finding-wrap");
+    if(fpSet.has(key)){ fpSet.delete(key); wrap.classList.remove("fp"); b.textContent = "Mark as FP"; }
+    else { fpSet.add(key); wrap.classList.add("fp"); b.textContent = "Unmark FP"; }
+    saveFP(); renderPills(); applyFilters();
+  });
+  document.querySelectorAll(".finding-wrap").forEach(w => {
+    const b = w.querySelector(".fp-btn"); if(!b) return;
+    if(fpSet.has(FKEY[b.dataset.fid])){ w.classList.add("fp"); b.textContent = "Unmark FP"; }
+  });
+  renderPills();
+}
+function applyFilters(){
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  const hideEmpty = document.getElementById("hideEmpty").checked;
+  let visible = 0;
+  document.querySelectorAll(".repo").forEach(el => {
+    const cb = el.querySelector(".repo-cb");
+    let shown = 0;
+    el.querySelectorAll(".finding-wrap").forEach(f => {
+      const on = f.classList.contains("fp") ? active.has("FP") : active.has(f.dataset.sev);
+      f.classList.toggle("hidden", !on);
+      if(on) shown++;
+    });
+    const nameMatch = !q || el.dataset.name.includes(q);
+    let show = cb.checked && nameMatch;
+    if(hideEmpty && shown === 0) show = false;
+    el.classList.toggle("hidden", !show);
+    if(show) visible++;
+  });
+  document.getElementById("visCount").textContent = `Showing ${visible} repo(s)`;
+}
+document.getElementById("selAll").onclick = () => { document.querySelectorAll(".repo-cb").forEach(cb => cb.checked = true); applyFilters(); };
+document.getElementById("selNone").onclick = () => { document.querySelectorAll(".repo-cb").forEach(cb => cb.checked = false); applyFilters(); };
+document.getElementById("hideEmpty").onchange = applyFilters;
+document.getElementById("clearFP").onclick = () => {
+  fpSet.clear(); saveFP();
+  document.querySelectorAll(".finding-wrap.fp").forEach(w => {
+    w.classList.remove("fp"); const b = w.querySelector(".fp-btn"); if(b) b.textContent = "Mark as FP";
+  });
+  renderPills(); applyFilters();
+};
+document.getElementById("search").oninput = applyFilters;
+document.getElementById("theme").onclick = () => {
+  const h = document.documentElement; const light = h.getAttribute("data-theme") === "light";
+  h.setAttribute("data-theme", light ? "dark" : "light");
+  document.getElementById("theme").innerHTML = light ? "&#9728; Light" : "&#127769; Dark";
+};
+renderStats(); renderPills(); renderList(); applyFilters();
+</script>
+</body></html>"""
+
+
+def render_batch_html(payload: dict) -> str:
+    """Render the interactive batch dashboard from a prepared payload."""
+    return _BATCH_HTML.replace("__DATA__", json.dumps(payload, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
 # Cost estimation (per 1M tokens)
 # ---------------------------------------------------------------------------
 

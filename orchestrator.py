@@ -503,6 +503,9 @@ Rules:
 - "id" is a sequential integer starting at 1.
 - "file" and "line" may be empty string and 0 if repo-wide.
 - Sort findings by severity (CRITICAL first).
+- Severity guidance: SQL injection and user-controlled code execution
+  (eval/exec/compile, or a shell/subprocess call built from untrusted input)
+  are CRITICAL.
 
 --- BEGIN REPORTS ---
 {combined_report}

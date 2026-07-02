@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 out/
 results.txt
+results.html
 /.claude
 mcprobe_gui.py

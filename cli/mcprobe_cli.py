@@ -19,10 +19,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import dotenv_values
 
-from orchestrator import build_app, extract_repo_name, _default_state_extras
+from orchestrator import (build_app, extract_repo_name, _default_state_extras,
+                          parse_repo_url)
 from helpers import (parse_ai_findings, generate_html_report, print_cost_summary,
                      estimate_prompt_chars_from_folder, estimate_tokens, MAX_OUTPUT_TOKENS,
-                     MODEL_PRICING)
+                     MODEL_PRICING, render_batch_html, read_source_snippet,
+                     next_results_html_path)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE = os.path.join(_PROJECT_ROOT, ".env")
@@ -447,6 +449,109 @@ def _build_merged_findings(result: dict) -> tuple:
     }
 
     return merged, stats, vdata.get("summary", summary or "")
+
+
+# ---------------------------------------------------------------------------
+# Interactive batch dashboard (rendered as the last pass of a run)
+# ---------------------------------------------------------------------------
+
+def _github_file_href(github_repo: str, file: str, line) -> str:
+    """Build a GitHub blob URL at a specific line, or '' if not derivable."""
+    if not github_repo or not file:
+        return ""
+    try:
+        base, ref = parse_repo_url(github_repo)
+    except Exception:
+        base, ref = github_repo, None
+    if not base.startswith("http"):
+        return ""                      # local path — no GitHub link
+    base = base[:-4] if base.endswith(".git") else base
+    href = f"{base}/blob/{ref or 'HEAD'}/{file}"
+    return href + (f"#L{line}" if line else "")
+
+
+def _stats_str(stats: dict) -> str:
+    if not stats:
+        return ""
+    parts = []
+    if stats.get("confirmed"):        parts.append(f"{stats['confirmed']} confirmed")
+    if stats.get("false_positives"):  parts.append(f"{stats['false_positives']} FP")
+    if stats.get("reclassified"):     parts.append(f"{stats['reclassified']} reclassified")
+    if stats.get("discovered"):       parts.append(f"{stats['discovered']} discovered")
+    return ", ".join(parts)
+
+
+_DASH_SEV = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
+
+def _build_batch_payload(results: list) -> dict:
+    """Turn the in-memory results into the dashboard payload (merged AI +
+    validation findings, embedded source snippets, precomputed links)."""
+    sev_counts = {s: 0 for s in _DASH_SEV}
+    repos = []
+    for r in results:
+        name = r.get("name", "?")
+        if "_error" in r:
+            repos.append({"name": name, "error": r["_error"], "lang": "", "ai": False,
+                          "high": None, "total": None, "stats": "", "report_href": "",
+                          "findings": []})
+            continue
+
+        merged, stats, _summary = _build_merged_findings(r)
+        repo_root = r.get("repo_local_path", "")
+        github_repo = r.get("github_repo", "")
+        findings = []
+        for f in merged:
+            sev = f.get("severity", "INFO")
+            if sev in sev_counts:
+                sev_counts[sev] += 1
+            file = f.get("file", "") or ""
+            line = f.get("line") or None
+            loc = (file + (f":{line}" if line else "")) if file else ""
+            verdict = f.get("_verdict", "")
+            findings.append({
+                "sev": sev,
+                "source": "VALIDATOR" if verdict == "discovered" else "ANALYZER",
+                "title": f.get("title", ""),
+                "location": loc, "file": file, "line": line,
+                "description": f.get("_evidence") or f.get("description", ""),
+                "verdict": verdict, "orig_sev": f.get("_original_severity", ""),
+                "snippet": read_source_snippet(repo_root, file, line),
+                "src_href": (f"../all_repos/{name}/{file}" if file else ""),
+                "github_href": _github_file_href(github_repo, file, line),
+            })
+
+        high = sum(1 for f in findings if f["sev"] in ("CRITICAL", "HIGH"))
+        ai_done = bool(r.get("ai_analysis")
+                       and "disabled" not in (r.get("ai_analysis") or "").lower())
+        repos.append({
+            "name": name, "error": None, "lang": r.get("language", "?"),
+            "ai": ai_done, "high": high, "total": len(findings),
+            "stats": _stats_str(stats),
+            "report_href": (f"{name}/report.html" if r.get("_html_report") else ""),
+            "findings": findings,
+        })
+
+    repos.sort(key=lambda x: x["name"].lower())
+    meta = {"total": len(repos),
+            "errors": sum(1 for x in repos if x["error"]),
+            "with_findings": sum(1 for x in repos if x["findings"]),
+            "sev_counts": sev_counts}
+    return {"repos": repos, "meta": meta}
+
+
+def _write_batch_dashboard(results: list, args) -> str:
+    """Render the interactive dashboard into out/analyses as a versioned file."""
+    if args.output:
+        analyses_dir = os.path.join(os.path.abspath(args.output), "analyses")
+    else:
+        analyses_dir = os.path.join(os.getcwd(), "out", "analyses")
+    payload = _build_batch_payload(results)
+    html = render_batch_html(payload)
+    path = next_results_html_path(analyses_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
 
 
 def _print_ai_single(result: dict, out=None):
@@ -1143,6 +1248,13 @@ def main():
     if tok_in or tok_out:
         print(f"\n[MCPROBE] Tokens — sent: {tok_in:,}  received: {tok_out:,}  "
               f"(total: {tok_in + tok_out:,})")
+
+    # Final pass (single-threaded): render the interactive results dashboard.
+    try:
+        dash_path = _write_batch_dashboard(results, args)
+        print(f"[MCPROBE] Results dashboard: {dash_path}")
+    except Exception as e:
+        print(f"[MCPROBE] Dashboard generation failed: {e}")
 
     _prompt_open_folder(results, args)
 
