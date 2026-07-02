@@ -346,6 +346,9 @@ def _print_summary(results: list, out=None):
         if "_error" in r:
             p(f"{r['name']:<{col_repo}}  ERROR: {r['_error'][:60]}")
             continue
+        if r.get("needs_oversight"):
+            p(f"{r.get('name', '?'):<{col_repo}}  MANUAL OVERSIGHT NEEDED (no MCP tools detected)")
+            continue
         ai_done = bool(
             r.get("ai_analysis") and
             "disabled" not in (r.get("ai_analysis") or "").lower()
@@ -492,9 +495,9 @@ def _build_batch_payload(results: list) -> dict:
     for r in results:
         name = r.get("name", "?")
         if "_error" in r:
-            repos.append({"name": name, "error": r["_error"], "lang": "", "ai": False,
-                          "high": None, "total": None, "stats": "", "report_href": "",
-                          "findings": []})
+            repos.append({"name": name, "error": r["_error"], "oversight": False,
+                          "lang": "", "ai": False, "high": None, "total": None,
+                          "stats": "", "report_href": "", "findings": []})
             continue
 
         merged, stats, _summary = _build_merged_findings(r)
@@ -525,7 +528,8 @@ def _build_batch_payload(results: list) -> dict:
         ai_done = bool(r.get("ai_analysis")
                        and "disabled" not in (r.get("ai_analysis") or "").lower())
         repos.append({
-            "name": name, "error": None, "lang": r.get("language", "?"),
+            "name": name, "error": None, "oversight": bool(r.get("needs_oversight")),
+            "lang": r.get("language", "?"),
             "ai": ai_done, "high": high, "total": len(findings),
             "stats": _stats_str(stats),
             "report_href": (f"{name}/report.html" if r.get("_html_report") else ""),

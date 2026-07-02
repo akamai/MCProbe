@@ -106,6 +106,8 @@ class State(TypedDict):
     repo_local_path: str
     code_analysis_path: str
     cfg_issues: int
+    mcp_tool_count: int         # MCP tool entry points found by the flow analyzer
+    needs_oversight: bool       # True when 0 tools found — halt analysis, flag repo
     analysis_root: str
     net_analysis_path: str
     net_issues: int
@@ -221,10 +223,18 @@ def analyze_repo_code(state: State) -> State:
     analysis_root = state["analysis_root"]
     os.makedirs(analysis_root, exist_ok=True)
     analyze_repo_path(repo_path, repo_name=state["name"], output_dir=analysis_root)
-    mcp_report_path, cfg_count = analyze_mcp_flow(repo_path, state["name"], analysis_root)
+    mcp_report_path, cfg_count, tool_count = analyze_mcp_flow(repo_path, state["name"], analysis_root)
     state["code_analysis_path"] = mcp_report_path
     state["cfg_issues"] = cfg_count
-    dprint(f"[CFG] Done — {cfg_count} finding(s) (MCP flow)")
+    state["mcp_tool_count"] = tool_count
+    dprint(f"[CFG] Done — {cfg_count} finding(s) across {tool_count} MCP tool(s)")
+
+    # No MCP tools detected → flag for manual oversight and halt the pipeline.
+    # (Downstream analyzer nodes and the AI node short-circuit on this flag.)
+    if tool_count == 0:
+        state["needs_oversight"] = True
+        dprint(f"[CFG] No MCP tools detected in {state['name']} — "
+               "flagging MANUAL OVERSIGHT NEEDED; skipping remaining analyzers")
     if state.get("validate"):
         pass  # extract_files_from_report already imported at top level
         _f = extract_files_from_report(mcp_report_path, state["repo_local_path"])
@@ -382,6 +392,11 @@ def _read_report(path: str, max_chars: int = 120_000) -> str:
 
 
 def use_ai(state: State) -> State:
+    if state.get("needs_oversight", False):
+        dprint("[AI] Manual oversight needed (no MCP tools) — skipping AI review")
+        state["ai_analysis"] = "Skipped: manual oversight needed — no MCP tools detected."
+        return state
+
     if state.get("offline_mode", False):
         dprint("[AI] Offline mode — skipping AI review")
         state["ai_analysis"] = "Offline mode: AI review disabled."
@@ -627,9 +642,11 @@ def route_after_static(state: State):
 
 
 def route_to_ai_or_end(state: State):
-    """After auth analysis: go to AI unless offline."""
+    """After auth analysis: go to AI unless offline or flagged for oversight."""
     from langgraph.graph import END as _END
-    if state.get("offline_mode", False) or not state.get("enabled_modules", {}).get("ai", True):
+    if (state.get("offline_mode", False)
+            or state.get("needs_oversight", False)
+            or not state.get("enabled_modules", {}).get("ai", True)):
         return _END
     return "use_ai"
 
@@ -645,6 +662,10 @@ def _timeout_wrapper(func, label):
     node is skipped and the original state is returned unchanged.
     """
     def wrapper(state):
+        # Halt: once a repo is flagged for manual oversight (no MCP tools),
+        # skip every remaining analyzer node.
+        if state.get("needs_oversight"):
+            return state
         timeout = state.get("module_timeout", 0)
         if not timeout:
             return func(state)
@@ -711,6 +732,8 @@ def _default_state_extras() -> dict:
         "analysis_root": "",
         "code_analysis_path": "",
         "cfg_issues": -1,
+        "mcp_tool_count": -1,
+        "needs_oversight": False,
         "net_analysis_path": "",
         "net_issues": -1,
         "bandit_analysis_path": "",

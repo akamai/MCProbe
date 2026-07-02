@@ -331,6 +331,7 @@ _BATCH_HTML = r"""<!DOCTYPE html>
                margin-left:auto; align-items:center; }
   .tag { background:var(--chip); border-radius:10px; padding:1px 8px; font-size:11px; }
   .tag.err { background:#d6303122; color:#ff7b72; }
+  .tag.oversight { background:#bf870022; color:#d29922; font-weight:700; }
   .findings { padding:2px 12px 10px 40px; }
   .finding-wrap { border-top:1px solid var(--border); }
   .finding-wrap:first-child { border-top:none; }
@@ -455,13 +456,14 @@ function renderList(){
     const meta = [];
     if(r.error){ meta.push(`<span class="tag err">ERROR</span>`); }
     else {
+      if(r.oversight) meta.push(`<span class="tag oversight">MANUAL OVERSIGHT</span>`);
       meta.push(`<span class="tag">${esc(r.lang||"?")}</span>`);
       if(r.high!=null) meta.push(`<span class="tag">${r.high} high / ${r.total} total</span>`);
       if(r.stats) meta.push(`<span class="tag">${esc(r.stats)}</span>`);
       meta.push(`<span class="tag">AI ${r.ai?"✓":"—"}</span>`);
     }
     return `
-    <div class="repo" data-idx="${i}" data-name="${esc(r.name.toLowerCase())}">
+    <div class="repo" data-idx="${i}" data-name="${esc(r.name.toLowerCase())}" data-flag="${(r.error||r.oversight)?1:0}">
       <div class="repo-head">
         <input type="checkbox" class="repo-cb" checked data-idx="${i}">
         <span class="repo-name">${repoLink(r)}</span>
@@ -504,7 +506,8 @@ function applyFilters(){
     });
     const nameMatch = !q || el.dataset.name.includes(q);
     let show = cb.checked && nameMatch;
-    if(hideEmpty && shown === 0) show = false;
+    // Keep flagged repos (errors / manual-oversight) visible even with no findings.
+    if(hideEmpty && shown === 0 && el.dataset.flag !== "1") show = false;
     el.classList.toggle("hidden", !show);
     if(show) visible++;
   });

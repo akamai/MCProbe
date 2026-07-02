@@ -974,7 +974,7 @@ def analyze_mcp_flow(
 ) -> Tuple[str, int]:
     """
     Orchestrator-compatible entry point.
-    Returns (report_path, issue_count).
+    Returns (report_path, issue_count, tool_count).
     """
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "mcp_flow_analysis.txt")
@@ -1007,7 +1007,7 @@ def analyze_mcp_flow(
         )
         with open(output_path, "w", encoding="utf-8") as fh:
             fh.write(msg)
-        return output_path, 0
+        return output_path, 0, 0
 
     traces = trace_all_entries(entries, index, depth)
     http_findings = _scan_http_handlers(index)
@@ -1017,7 +1017,7 @@ def analyze_mcp_flow(
         total_funcs, total_files, output_path,
     )
     dprint(f"[FLOW] Done — {issue_count} finding(s) across {len(entries)} tool(s)")
-    return output_path, issue_count
+    return output_path, issue_count, len(entries)
 
 
 def analyze(repo_path: str, output_path: str) -> int:
@@ -1027,5 +1027,5 @@ def analyze(repo_path: str, output_path: str) -> int:
     """
     repo_name = os.path.basename(repo_path.rstrip("/\\")) or "repo"
     output_dir = os.path.dirname(output_path) or "."
-    _, count = analyze_mcp_flow(repo_path, repo_name, output_dir)
+    _, count, _tools = analyze_mcp_flow(repo_path, repo_name, output_dir)
     return count
