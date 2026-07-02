@@ -218,7 +218,7 @@ def analyze_repo_code(state: State) -> State:
         return state
     dprint("[CFG] Running MCP flow analyzer")
     from analyzers.code_analyzer import analyze_repo_path
-    from analyzers.mcp_flow_analyzer import analyze_mcp_flow
+    from analyzers.mcp_flow_analyzer import analyze_mcp_flow, has_mcp_tool_signal
     repo_path = state["repo_local_path"]
     analysis_root = state["analysis_root"]
     os.makedirs(analysis_root, exist_ok=True)
@@ -229,12 +229,17 @@ def analyze_repo_code(state: State) -> State:
     state["mcp_tool_count"] = tool_count
     dprint(f"[CFG] Done — {cfg_count} finding(s) across {tool_count} MCP tool(s)")
 
-    # No MCP tools detected → flag for manual oversight and halt the pipeline.
-    # (Downstream analyzer nodes and the AI node short-circuit on this flag.)
+    # The flow tracer found no traceable entry points. Only flag for manual
+    # oversight if the repo shows NO MCP tool/SDK signal at all — otherwise it's
+    # a real MCP server the tracer just couldn't resolve, so keep analyzing it.
     if tool_count == 0:
-        state["needs_oversight"] = True
-        dprint(f"[CFG] No MCP tools detected in {state['name']} — "
-               "flagging MANUAL OVERSIGHT NEEDED; skipping remaining analyzers")
+        if has_mcp_tool_signal(repo_path):
+            dprint(f"[CFG] 0 traceable tool entry points in {state['name']}, but "
+                   "MCP tool/SDK signals present — continuing full analysis")
+        else:
+            state["needs_oversight"] = True
+            dprint(f"[CFG] No MCP tools or SDK signals in {state['name']} — "
+                   "flagging MANUAL OVERSIGHT NEEDED; skipping remaining analyzers")
     if state.get("validate"):
         pass  # extract_files_from_report already imported at top level
         _f = extract_files_from_report(mcp_report_path, state["repo_local_path"])
@@ -420,17 +425,26 @@ def use_ai(state: State) -> State:
     if existing and os.path.isfile(existing):
         try:
             with open(existing, "r", encoding="utf-8", errors="replace") as f:
-                state["ai_analysis"] = f.read().strip()
+                cached = f.read().strip()
+        except Exception:
+            cached = ""
+        # Never reuse a cached review that represents a failure or a placeholder
+        # (e.g. a prior run where the AI call errored) — regenerate instead.
+        low = cached.lower()
+        is_bad = (not cached) or any(m in low for m in (
+            "analysis failed", "scan failed", "skipped:", "offline mode:",
+            "ai review disabled", "unknown ai backend"))
+        if cached and not is_bad:
+            state["ai_analysis"] = cached
             dprint(f"[AI] Using existing review for {repo_name}")
             if state.get("calc_cost", False):
-                pass  # estimate_prompt_chars_from_folder already imported at top level
                 state["prompt_chars"] = estimate_prompt_chars_from_folder(analysis_root)
             if state.get("validate"):
                 from analyzers.ai.validate import estimate_validate_chars
                 state["validate_chars"] = estimate_validate_chars(state)
             return state
-        except Exception:
-            pass
+        if cached:
+            dprint(f"[AI] Cached review for {repo_name} was a failure/placeholder — re-running")
 
     dprint("[AI] Running AI security review")
     repo_path = state.get("repo_local_path", "")
@@ -538,6 +552,7 @@ Rules:
 
     backend = state.get("ai_backend", os.getenv("MCPROBE_AI_BACKEND", "claude")).lower()
     ai_output = ""
+    ai_failed = False
 
     _use_os = state.get("use_os_env", False)
     _silence_sdk_loggers()
@@ -564,7 +579,8 @@ Rules:
             state["tokens_in"] = state.get("tokens_in", 0) + _ti
             state["tokens_out"] = state.get("tokens_out", 0) + _to
         except Exception as e:
-            ai_output = f'{{"summary":"Claude analysis failed: {type(e).__name__}","findings":[]}}'
+            ai_output = f'{{"summary":"Claude analysis failed: {type(e).__name__}: {e}","findings":[]}}'
+            ai_failed = True
 
     elif backend == "openai":
         try:
@@ -590,7 +606,8 @@ Rules:
             state["tokens_in"] = state.get("tokens_in", 0) + _ti
             state["tokens_out"] = state.get("tokens_out", 0) + _to
         except Exception as e:
-            ai_output = f'{{"summary":"OpenAI analysis failed: {type(e).__name__}","findings":[]}}'
+            ai_output = f'{{"summary":"OpenAI analysis failed: {type(e).__name__}: {e}","findings":[]}}'
+            ai_failed = True
 
     elif backend == "claude-agent":
         try:
@@ -601,13 +618,17 @@ Rules:
         except Exception as e:
             ai_output = f"Agent scan failed: {type(e).__name__}: {e}"
             state["agent_issues"] = -1
+            ai_failed = True
 
     else:
         ai_output = f'{{"summary":"Unknown AI backend: {backend}","findings":[]}}'
+        ai_failed = True
 
     state["ai_analysis"] = ai_output
 
-    if analysis_root:
+    # Only persist SUCCESSFUL reviews — never cache a failure, or the next run
+    # would silently reuse it and report zero findings.
+    if analysis_root and not ai_failed:
         try:
             os.makedirs(analysis_root, exist_ok=True)
             out_path = os.path.join(analysis_root, "ai_security_review.json")
@@ -616,7 +637,10 @@ Rules:
         except Exception:
             pass
 
-    dprint(f"[AI] Review complete — saved to {analysis_root}")
+    if ai_failed:
+        dprint(f"[AI] ⚠ FAILED for {repo_name} — {ai_output[:200]}")
+    else:
+        dprint(f"[AI] Review complete — saved to {analysis_root}")
     if state.get("validate"):
         from analyzers.ai.validate import estimate_validate_chars
         state["validate_chars"] = estimate_validate_chars(state)

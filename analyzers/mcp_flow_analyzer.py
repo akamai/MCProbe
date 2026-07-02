@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import concurrent.futures
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
@@ -964,6 +965,58 @@ def _count_source_files(repo_path: str) -> Tuple[int, int]:
             elif ext in _JS_EXT:
                 js_count += 1
     return py_count, js_count
+
+
+# Broad, lenient signals that a repo is an MCP server exposing tools. Used ONLY
+# to decide whether a 0-traceable-entry-points repo should be flagged for manual
+# oversight — the flow tracer's own detection is intentionally narrower.
+_MCP_SIGNAL_RE = re.compile(
+    r'@tool\b|@\w+\.tool\b|@\w+\.call_tool\b'
+    r'|\.tool\s*\(|\.add_tool\s*\(|\.registerTool\s*\(|\baddTool\s*\(|\bregister_tool\s*\('
+    r'|\bcall_tool\b|\blist_tools\b|CallToolRequestSchema|ListToolsRequestSchema'
+    r'|\bFastMCP\b|\bMcpServer\b|modelcontextprotocol|from\s+mcp\b|import\s+mcp\b'
+)
+
+_SIGNAL_EXT = frozenset({".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".mts"})
+_SIGNAL_MANIFESTS = frozenset({"package.json", "pyproject.toml", "requirements.txt"})
+
+
+def has_mcp_tool_signal(repo_path: str, max_files: int = 800) -> bool:
+    """Return True if the repo shows ANY sign of being an MCP server that
+    exposes tools (SDK import, FastMCP/McpServer, @tool / add_tool /
+    registerTool / call_tool / setRequestHandler, or an SDK dependency).
+
+    This is deliberately lenient: when in doubt we return True so real MCP
+    servers are never skipped just because the tracer couldn't resolve their
+    entry points."""
+    scanned = 0
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d.lower() not in EXCLUDE_DIRS]
+        for fname in files:
+            low = fname.lower()
+            ext = os.path.splitext(low)[1]
+            is_manifest = low in _SIGNAL_MANIFESTS
+            if ext not in _SIGNAL_EXT and not is_manifest:
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                if os.path.getsize(fpath) > 2_000_000:
+                    continue
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except Exception:
+                continue
+            scanned += 1
+            if is_manifest:
+                low_text = text.lower()
+                if "modelcontextprotocol" in low_text or "fastmcp" in low_text \
+                        or '"mcp"' in text or "\nmcp" in low_text:
+                    return True
+            elif _MCP_SIGNAL_RE.search(text):
+                return True
+            if scanned >= max_files:
+                return False
+    return False
 
 
 def analyze_mcp_flow(

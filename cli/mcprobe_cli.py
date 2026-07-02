@@ -138,6 +138,48 @@ def _resolve_model_name(args, api_config: dict) -> str:
     return args.model or api_config.get("ai_model") or default
 
 
+def _preflight_ai(args, api_config: dict):
+    """Send one tiny request to the chosen model before scanning anything.
+    If it errors (bad model, endpoint, or key), abort immediately instead of
+    running the whole scan only to have every AI review fail silently."""
+    backend = args.backend
+    model = _resolve_model_name(args, api_config)
+    use_os = getattr(args, "use_os_env", False)
+    print(f"[MCPROBE] Preflight — checking model '{model}' ({backend})…")
+    try:
+        if backend in ("claude", "claude-agent"):
+            import anthropic
+            api_key = api_config.get("anthropic_api_key") or (os.getenv("ANTHROPIC_API_KEY", "") if use_os else "")
+            base_url = api_config.get("anthropic_base_url") or (os.getenv("ANTHROPIC_BASE_URL") if use_os else None) or None
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = anthropic.Anthropic(**kwargs)
+            client.messages.create(
+                model=model, max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        elif backend == "openai":
+            from openai import OpenAI
+            api_key = api_config.get("openai_api_key") or (os.getenv("OPENAI_API_KEY", "") if use_os else "")
+            base_url = api_config.get("openai_base_url") or (os.getenv("OPENAI_BASE_URL") if use_os else None) or None
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            client.chat.completions.create(
+                model=model, max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+    except Exception as e:
+        print(f"\n[MCPROBE] ERROR: AI model '{model}' ({backend}) is not usable — "
+              f"{type(e).__name__}: {e}")
+        print("[MCPROBE] Aborting before scan. Fix the model name / endpoint / API key, "
+              "or run with --offline (or --no-ai) to skip the AI review.")
+        sys.exit(3)
+    print(f"[MCPROBE] Preflight OK — '{model}' is reachable.")
+
+
 _print_lock = threading.Lock()
 _shutdown = threading.Event()
 
@@ -834,10 +876,12 @@ def _has_high_findings(results: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Post-run: offer to open analysis folder
+# Post-run: open the results dashboard
 # ---------------------------------------------------------------------------
 
-def _open_folder(path: str):
+def _open_path(path: str):
+    """Open a file/folder with the OS default handler (a .html opens in the
+    default browser)."""
     import subprocess
     if sys.platform == "win32":
         os.startfile(path)
@@ -845,44 +889,6 @@ def _open_folder(path: str):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
-
-
-def _prompt_open_folder(results: list, args):
-    """Ask the user if they want to open the analysis folder. Enter = yes."""
-    # Collect folders that actually exist
-    folders = []
-    for r in results:
-        if "_error" in r:
-            continue
-        root = r.get("analysis_root", "")
-        if not root and args.output:
-            root = os.path.join(os.path.abspath(args.output), "analyses",
-                                r.get("name", ""))
-        if not root:
-            root = os.path.join(os.getcwd(), "out", "analyses", r.get("name", ""))
-        if os.path.isdir(root):
-            folders.append((r.get("name", "?"), root))
-
-    if not folders:
-        return
-
-    if len(folders) == 1:
-        name, folder = folders[0]
-        try:
-            answer = input(f"\nOpen analysis folder for {name}? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if answer in ("", "y", "yes"):
-            _open_folder(folder)
-    else:
-        # Batch: offer to open the parent analyses directory
-        parent = os.path.dirname(folders[0][1])
-        try:
-            answer = input(f"\nOpen analyses folder ({len(folders)} repos)? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if answer in ("", "y", "yes"):
-            _open_folder(parent)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1056,8 @@ def main():
             print(f"[MCPROBE] ⚠ No pricing table entry for '{model_name}' — "
                   f"cost estimates will show $0. Add it to MODEL_PRICING in helpers.py "
                   f"for accurate cost/threshold behaviour.")
+        # Fail fast: verify the model actually responds before scanning anything.
+        _preflight_ai(args, api_config)
 
     want_validate = not getattr(args, "no_validate", False) and not offline
     do_validate = want_validate and not args.calc_cost
@@ -1253,14 +1261,20 @@ def main():
         print(f"\n[MCPROBE] Tokens — sent: {tok_in:,}  received: {tok_out:,}  "
               f"(total: {tok_in + tok_out:,})")
 
-    # Final pass (single-threaded): render the interactive results dashboard.
+    # Final pass (single-threaded): render the interactive results dashboard,
+    # then open it in the browser (instead of prompting to open the folder).
+    dash_path = None
     try:
         dash_path = _write_batch_dashboard(results, args)
         print(f"[MCPROBE] Results dashboard: {dash_path}")
     except Exception as e:
         print(f"[MCPROBE] Dashboard generation failed: {e}")
 
-    _prompt_open_folder(results, args)
+    if dash_path and os.path.isfile(dash_path):
+        try:
+            _open_path(dash_path)
+        except Exception as e:
+            print(f"[MCPROBE] Could not open dashboard: {e}")
 
     if errors:
         exit_code = 2
