@@ -519,9 +519,11 @@ def _print_ai_single(result: dict, out=None):
 
 
 def _print_ai_batch(results: list, out=None):
-    """Per-repo validated findings for batch mode. Only CRITICAL/HIGH shown."""
+    """Per-repo validated findings for batch mode. Only CRITICAL/HIGH shown;
+    repos with no CRITICAL/HIGH findings are omitted entirely."""
     p = lambda *a, **kw: print(*a, **kw, file=out) if out else print(*a, **kw)
-    p(f"\n--- Findings (CRITICAL / HIGH only) ---")
+
+    printed_any = False
     for r in results:
         if "_error" in r:
             continue
@@ -530,6 +532,14 @@ def _print_ai_batch(results: list, out=None):
         all_findings, stats, _ = _build_merged_findings(r)
         high_findings = [f for f in all_findings
                          if f.get("severity", "INFO") in ("CRITICAL", "HIGH")]
+
+        # Omit repos with nothing CRITICAL/HIGH from the final output.
+        if not high_findings:
+            continue
+
+        if not printed_any:
+            p(f"\n--- Findings (CRITICAL / HIGH only) ---")
+            printed_any = True
 
         header = f"\n  {name} ({len(high_findings)} high"
         if stats:
@@ -548,10 +558,6 @@ def _print_ai_batch(results: list, out=None):
                 header += f" — {', '.join(parts)}"
         header += "):"
         p(header)
-
-        if not high_findings:
-            p(f"    No CRITICAL/HIGH findings.")
-            continue
 
         for i, f in enumerate(high_findings, 1):
             sev = f.get("severity", "?")
@@ -573,6 +579,10 @@ def _print_ai_batch(results: list, out=None):
             if evidence and verdict != "discovered":
                 oneliner = evidence.split("\n")[0].split(". ")[0]
                 p(f"              Description: {oneliner}")
+
+    if not printed_any:
+        p(f"\n--- Findings (CRITICAL / HIGH only) ---")
+        p(f"  No CRITICAL/HIGH findings in any scanned repo.")
 
 
 def _print_reports(results: list, out=None):
