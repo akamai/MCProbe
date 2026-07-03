@@ -129,6 +129,7 @@ class State(TypedDict):
     ai_model: str               # model name override (empty = use default)
     calc_cost: bool             # dry-run: measure prompt size, skip API call
     ai_only: bool               # --ai-only: analyzers skipped, don't announce them
+    refresh_ai: bool            # --refresh-ai: ignore any cached AI review, re-run it
     tokens_in: int              # cumulative AI input tokens (review + validation)
     tokens_out: int             # cumulative AI output tokens (review + validation)
     validate_tokens_in: int     # input tokens used by the validation pass only
@@ -434,7 +435,7 @@ def use_ai(state: State) -> State:
         is_bad = (not cached) or any(m in low for m in (
             "analysis failed", "scan failed", "skipped:", "offline mode:",
             "ai review disabled", "unknown ai backend"))
-        if cached and not is_bad:
+        if cached and not is_bad and not state.get("refresh_ai"):
             state["ai_analysis"] = cached
             dprint(f"[AI] Using existing review for {repo_name}")
             if state.get("calc_cost", False):
@@ -443,7 +444,9 @@ def use_ai(state: State) -> State:
                 from analyzers.ai.validate import estimate_validate_chars
                 state["validate_chars"] = estimate_validate_chars(state)
             return state
-        if cached:
+        if cached and state.get("refresh_ai"):
+            dprint(f"[AI] --refresh-ai — ignoring cached review for {repo_name}, re-running")
+        elif cached:
             dprint(f"[AI] Cached review for {repo_name} was a failure/placeholder — re-running")
 
     dprint("[AI] Running AI security review")
@@ -778,6 +781,7 @@ def _default_state_extras() -> dict:
         "ai_model": "",
         "calc_cost": False,
         "ai_only": False,
+        "refresh_ai": False,
         "tokens_in": 0,
         "tokens_out": 0,
         "validate_tokens_in": 0,

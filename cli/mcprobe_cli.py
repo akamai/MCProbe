@@ -120,6 +120,7 @@ def _build_initial_state(repo_url: str, repo_name: str, args, api_config: dict) 
     extras["_env_file"]          = api_config.get("_env_file", "")
     extras["calc_cost"]          = getattr(args, "calc_cost", False)
     extras["ai_only"]            = getattr(args, "ai_only", False)
+    extras["refresh_ai"]         = getattr(args, "refresh_ai", False)
     extras["validate"]           = not getattr(args, "no_validate", False)
     extras["cost_threshold"]     = getattr(args, "cost_threshold", 5.0)
     extras["module_timeout"]     = getattr(args, "timeout", 0) or 0
@@ -987,6 +988,8 @@ def main():
                     help="Dry run: scan repos and estimate AI cost without calling the API")
     ai.add_argument("--no-validate", action="store_true",
                     help="Skip AI validation of findings (validation runs by default)")
+    ai.add_argument("--refresh-ai", "--rai", action="store_true", dest="refresh_ai",
+                    help="Ignore any cached AI review and re-run the AI analysis")
     ai.add_argument("--cost-threshold", type=float, default=5.0, metavar="$",
                     help="Auto-confirm validation if the TOTAL estimated validation "
                          "cost across all repos is below this threshold in USD "
