@@ -540,6 +540,144 @@ def render_batch_html(payload: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Analyzer report parsing — turn each analyzer's .txt report into structured
+# findings so they can be shown independently of (and separate from) the AI.
+# ---------------------------------------------------------------------------
+
+_ANA_SEV_NORM = {"ERROR": "HIGH", "WARN": "MEDIUM", "WARNING": "MEDIUM",
+                 "CRITICAL": "CRITICAL", "HIGH": "HIGH", "MEDIUM": "MEDIUM",
+                 "LOW": "LOW", "INFO": "INFO"}
+_VALID_SEV = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
+_LABELED_HEAD_RE = re.compile(r'^\[(\w+)\]\s+(\S.*)$')
+_FILE_FIELD_RE   = re.compile(r'File\s*:\s*(.+?)(?::(\d+))?\s*$', re.I)
+_DETAIL_FIELD_RE = re.compile(r'Detail\s*:\s*(.*)$', re.I)
+_BANDIT_LINE_RE  = re.compile(r'^(.*?):(\d+)\s+\[(B\d+)\]\s+(.*?)\s+\(Severity:\s*(\w+)', re.I)
+_SEMGREP_LINE_RE = re.compile(r'^(.*?):(\d+)\s+\[(\w+)\]\s+(.*)$')
+_FLOW_TOOL_RE    = re.compile(r'TOOL:\s*\S+\s+\[(.+?):(\d+)\]')
+_FLOW_LOC_RE     = re.compile(r'\[([^\[\]]+?):(\d+)\]')
+_FLOW_SINK_RE    = re.compile(r'⚡\s*\[(\w+)\]\s*(.+?)(?:\s{2,}\(via:.*)?$')
+
+
+def _read_analyzer_report(state: dict, key: str, fname: str) -> str:
+    p = state.get(key, "")
+    if not p:
+        root = state.get("analysis_root", "")
+        p = os.path.join(root, fname) if root else ""
+    if p and os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            return ""
+    return ""
+
+
+def _rel_to_repo(path: str, repo_root: str) -> str:
+    if not path:
+        return ""
+    if repo_root:
+        try:
+            ap, rr = os.path.normpath(path), os.path.normpath(repo_root)
+            if ap.lower().startswith(rr.lower()):
+                return os.path.relpath(ap, rr).replace("\\", "/")
+        except Exception:
+            pass
+    return path.replace("\\", "/")
+
+
+def _mk_finding(sev, title, file, line, module, desc=""):
+    sev = _ANA_SEV_NORM.get((sev or "").upper(), (sev or "").upper())
+    if sev not in _VALID_SEV:
+        sev = "INFO"
+    return {"severity": sev, "title": (title or "").strip(),
+            "file": (file or "").replace("\\", "/"), "line": line,
+            "description": desc, "module": module, "source": "ANALYZER"}
+
+
+def _parse_labeled(text, module):
+    out, lines = [], text.splitlines()
+    for i, raw in enumerate(lines):
+        m = _LABELED_HEAD_RE.match(raw.strip())
+        if not m or m.group(1).upper() not in _VALID_SEV:
+            continue
+        file, line, detail = "", None, ""
+        for j in range(i + 1, min(i + 7, len(lines))):
+            nxt = lines[j].strip()
+            if not nxt or _LABELED_HEAD_RE.match(nxt):
+                break
+            fm = _FILE_FIELD_RE.search(lines[j])
+            if fm:
+                file = fm.group(1).strip()
+                line = int(fm.group(2)) if fm.group(2) else None
+            dm = _DETAIL_FIELD_RE.search(lines[j])
+            if dm:
+                detail = dm.group(1).strip()
+        out.append(_mk_finding(m.group(1), m.group(2), file, line, module, detail))
+    return out
+
+
+def _parse_bandit(text, root):
+    out = []
+    for raw in text.splitlines():
+        m = _BANDIT_LINE_RE.match(raw.strip())
+        if m:
+            out.append(_mk_finding(m.group(5), f"{m.group(3)}: {m.group(4)}",
+                                   _rel_to_repo(m.group(1), root), int(m.group(2)), "bandit"))
+    return out
+
+
+def _parse_semgrep(text, root):
+    out = []
+    for raw in text.splitlines():
+        m = _SEMGREP_LINE_RE.match(raw.strip())
+        if m:
+            out.append(_mk_finding(m.group(3), m.group(4)[:140],
+                                   _rel_to_repo(m.group(1), root), int(m.group(2)), "semgrep"))
+    return out
+
+
+def _parse_flow(text):
+    out, seen, lines = [], set(), text.splitlines()
+    tool_loc = ("", None)
+    for i, raw in enumerate(lines):
+        th = _FLOW_TOOL_RE.search(raw)
+        if th:
+            tool_loc = (th.group(1), int(th.group(2)))
+            continue
+        sk = _FLOW_SINK_RE.search(raw)
+        if not sk:
+            continue
+        sev, title = sk.group(1), sk.group(2).strip()
+        file, line = tool_loc
+        for j in range(i, min(i + 3, len(lines))):    # nearest concrete sink location
+            lm = _FLOW_LOC_RE.search(lines[j])
+            if lm:
+                file, line = lm.group(1), int(lm.group(2))
+                break
+        key = (sev.upper(), title, file, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_mk_finding(sev, title, file, line, "flow"))
+    return out
+
+
+def parse_analyzer_findings(state: dict) -> list:
+    """Structured findings straight from the analyzer reports, independent of
+    the AI review. Each carries source='ANALYZER' and a 'module' tag."""
+    root = state.get("repo_local_path", "")
+    out = []
+    out += _parse_flow(_read_analyzer_report(state, "code_analysis_path", "mcp_flow_analysis.txt"))
+    out += _parse_labeled(_read_analyzer_report(state, "net_analysis_path", "network_analysis.txt"), "network")
+    out += _parse_labeled(_read_analyzer_report(state, "auth_analysis_path", "auth_analysis.txt"), "auth")
+    out += _parse_labeled(_read_analyzer_report(state, "sse_analysis_path", "sse_analysis.txt"), "sse")
+    out += _parse_bandit(_read_analyzer_report(state, "bandit_analysis_path", "bandit_analysis.txt"), root)
+    out += _parse_semgrep(_read_analyzer_report(state, "semgrep_analysis_path", "semgrep_analysis.txt"), root)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Cost estimation (per 1M tokens)
 # ---------------------------------------------------------------------------
 

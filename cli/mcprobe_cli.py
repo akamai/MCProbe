@@ -435,66 +435,102 @@ def _load_validation(result: dict) -> dict | None:
 
 def _build_merged_findings(result: dict) -> tuple:
     """
-    Merge original AI findings with validation verdicts into one list.
+    Build the full findings list as three separate, clearly-tagged layers:
 
-    Returns (merged_findings, stats_dict_or_None).
-    Each merged finding has keys: severity, title, file, line,
-    and when validated: _verdict, _evidence, _original_severity.
-    stats_dict has: confirmed, false_positives, reclassified, discovered.
+      1. ANALYZER findings — parsed straight from the analyzer reports
+         (flow / network / auth / sse / bandit / semgrep). Always present,
+         independent of the AI. source="ANALYZER", module=<analyzer>.
+      2. AI findings — the AI review's own findings, with validation verdicts
+         applied (false positives dropped, severity reclassified). source="AI".
+      3. VALIDATOR findings — new issues the validator discovered. source="VALIDATOR".
+
+    Returns (merged_findings, stats_dict_or_None, summary). Each finding carries
+    severity, title, file, line, source, module, _verdict, _evidence,
+    _original_severity. stats (validation) has confirmed/false_positives/
+    reclassified/discovered.
     """
+    from helpers import parse_analyzer_findings
+
+    def _key(f):
+        fl = (f.get("file") or "").replace("\\", "/").lower()
+        ln = f.get("line")
+        return (fl, ln) if fl and ln else None
+
+    # 1) AI layer (+ validation verdicts). Track the (file, line) it covers so
+    #    the AI can supersede the raw analyzer finding at the same spot.
     ai_data = parse_ai_findings(result.get("ai_analysis", ""))
     original = ai_data.get("findings", [])
     summary = ai_data.get("summary", "")
-
     vdata = _load_validation(result)
-    if not vdata:
-        return original, None, summary
+    stats = None
+    ai_layer = []
+    covered = set()
 
-    validated = vdata.get("validated_findings", [])
-    new_findings = vdata.get("new_findings", [])
+    if vdata:
+        validated = vdata.get("validated_findings", [])
+        new_findings = vdata.get("new_findings", [])
+        verdict_map = {v.get("id"): v for v in validated if v.get("id") is not None}
 
-    verdict_map = {}
-    for v in validated:
-        vid = v.get("id")
-        if vid is not None:
-            verdict_map[vid] = v
+        for i, f in enumerate(original, 1):
+            v = verdict_map.get(i, {})
+            verdict = v.get("verdict", "confirmed")
+            if verdict == "false_positive":
+                continue
+            e = dict(f)
+            e["source"] = "AI"
+            e["_verdict"] = verdict
+            e["_evidence"] = v.get("evidence", "")
+            e["_original_severity"] = f.get("severity", "?")
+            if verdict == "severity_changed" and v.get("new_severity"):
+                e["severity"] = v["new_severity"]
+            k = _key(e)
+            if k:
+                covered.add(k)
+            ai_layer.append(e)
 
-    n_confirmed = sum(1 for v in validated if v.get("verdict") == "confirmed")
-    n_fp = sum(1 for v in validated if v.get("verdict") == "false_positive")
-    n_changed = sum(1 for v in validated if v.get("verdict") == "severity_changed")
+        for nf in new_findings:
+            e = dict(nf)
+            e["source"] = "VALIDATOR"
+            e["_verdict"] = "discovered"
+            e["_evidence"] = ""
+            e["_original_severity"] = nf.get("severity", "?")
+            k = _key(e)
+            if k:
+                covered.add(k)
+            ai_layer.append(e)
 
-    merged = []
-    for i, f in enumerate(original, 1):
-        v = verdict_map.get(i, {})
-        verdict = v.get("verdict", "confirmed")
+        stats = {
+            "confirmed": sum(1 for v in validated if v.get("verdict") == "confirmed"),
+            "false_positives": sum(1 for v in validated if v.get("verdict") == "false_positive"),
+            "reclassified": sum(1 for v in validated if v.get("verdict") == "severity_changed"),
+            "discovered": len(new_findings),
+        }
+        summary = vdata.get("summary", summary or "")
+    else:
+        for f in original:
+            e = dict(f)
+            e["source"] = "AI"
+            e["_verdict"] = ""
+            e["_evidence"] = ""
+            e["_original_severity"] = f.get("severity", "?")
+            k = _key(e)
+            if k:
+                covered.add(k)
+            ai_layer.append(e)
 
-        if verdict == "false_positive":
+    # 2) Analyzer layer — always present, EXCEPT where the AI already reports the
+    #    same file:line (the AI's richer/validated finding supersedes it).
+    analyzer_layer = []
+    for f in parse_analyzer_findings(result):
+        if _key(f) in covered:
             continue
+        e = dict(f)
+        e["_verdict"] = ""
+        e["_evidence"] = f.get("description", "")
+        e["_original_severity"] = f.get("severity", "?")
+        analyzer_layer.append(e)
 
-        entry = dict(f)
-        entry["_verdict"] = verdict
-        entry["_evidence"] = v.get("evidence", "")
-        entry["_original_severity"] = f.get("severity", "?")
-
-        if verdict == "severity_changed" and v.get("new_severity"):
-            entry["severity"] = v["new_severity"]
-
-        merged.append(entry)
-
-    for nf in new_findings:
-        entry = dict(nf)
-        entry["_verdict"] = "discovered"
-        entry["_evidence"] = ""
-        merged.append(entry)
-
-    stats = {
-        "confirmed": n_confirmed,
-        "false_positives": n_fp,
-        "reclassified": n_changed,
-        "discovered": len(new_findings),
-    }
-
-    return merged, stats, vdata.get("summary", summary or "")
+    return analyzer_layer + ai_layer, stats, summary
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +591,11 @@ def _build_batch_payload(results: list) -> dict:
             line = f.get("line") or None
             loc = (file + (f":{line}" if line else "")) if file else ""
             verdict = f.get("_verdict", "")
+            _src = f.get("source", "ANALYZER")
+            _mod = f.get("module", "")
             findings.append({
                 "sev": sev,
-                "source": "VALIDATOR" if verdict == "discovered" else "ANALYZER",
+                "source": f"{_src}:{_mod}" if _mod else _src,
                 "title": f.get("title", ""),
                 "location": loc, "file": file, "line": line,
                 "description": f.get("_evidence") or f.get("description", ""),
@@ -651,7 +689,9 @@ def _print_ai_single(result: dict, out=None):
                 loc += f":{f['line']}"
             verdict = f.get("_verdict", "")
             orig_sev = f.get("_original_severity", "")
-            source = "[VALIDATOR]" if verdict == "discovered" else "[ANALYZER]"
+            _src = f.get("source", "ANALYZER")
+            _mod = f.get("module", "")
+            source = f"[{_src}{':' + _mod if _mod else ''}]"
 
             if verdict == "severity_changed" and orig_sev and orig_sev != sev:
                 p(f"    {n}. [{orig_sev} -> {sev}] {source} {title}")
@@ -719,7 +759,9 @@ def _print_ai_batch(results: list, out=None):
                 loc += f":{f['line']}"
             verdict = f.get("_verdict", "")
             orig_sev = f.get("_original_severity", "")
-            source = "[VALIDATOR]" if verdict == "discovered" else "[ANALYZER]"
+            _src = f.get("source", "ANALYZER")
+            _mod = f.get("module", "")
+            source = f"[{_src}{':' + _mod if _mod else ''}]"
 
             if verdict == "severity_changed" and orig_sev and orig_sev != sev:
                 p(f"    {i}. [{orig_sev} -> {sev}] {source} {title}")
