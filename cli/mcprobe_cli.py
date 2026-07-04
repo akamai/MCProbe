@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import dotenv_values
 
 from orchestrator import (build_app, extract_repo_name, _default_state_extras,
-                          parse_repo_url)
+                          parse_repo_url, write_analysis_meta)
 from helpers import (parse_ai_findings, generate_html_report, print_cost_summary,
                      estimate_prompt_chars_from_folder, estimate_tokens, MAX_OUTPUT_TOKENS,
                      MODEL_PRICING, render_batch_html, read_source_snippet,
@@ -120,7 +120,7 @@ def _build_initial_state(repo_url: str, repo_name: str, args, api_config: dict) 
     extras["_env_file"]          = api_config.get("_env_file", "")
     extras["calc_cost"]          = getattr(args, "calc_cost", False)
     extras["ai_only"]            = getattr(args, "ai_only", False)
-    extras["refresh_ai"]         = getattr(args, "refresh_ai", False)
+    extras["refresh"]            = getattr(args, "refresh", False)
     extras["validate"]           = not getattr(args, "no_validate", False)
     extras["cost_threshold"]     = getattr(args, "cost_threshold", 5.0)
     extras["module_timeout"]     = getattr(args, "timeout", 0) or 0
@@ -934,6 +934,35 @@ def _open_path(path: str):
         subprocess.Popen(["xdg-open", path])
 
 
+def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
+    """Build a result dict for an already-analyzed repo straight from its
+    on-disk analysis, so --skip-analyzed repos still appear in the summary,
+    findings, and dashboard instead of vanishing from the output."""
+    from orchestrator import load_analysis_meta
+    r = {
+        "name": repo_name,
+        "analysis_root": analysis_root,
+        "repo_local_path": os.path.join(os.getcwd(), "out", "all_repos", repo_name),
+        "use_cached_analysis": True,
+    }
+    meta = load_analysis_meta(analysis_root) or {}
+    for k in ("language", "cfg_issues", "mcp_tool_count", "net_issues", "sse_issues",
+              "auth_issues", "bandit_high", "semgrep_issues", "needs_oversight"):
+        if meta.get(k) is not None:
+            r[k] = meta[k]
+    ai_p = os.path.join(analysis_root, "ai_security_review.json")
+    if os.path.isfile(ai_p):
+        try:
+            with open(ai_p, "r", encoding="utf-8", errors="replace") as f:
+                r["ai_analysis"] = f.read()
+        except Exception:
+            pass
+    html_p = os.path.join(analysis_root, "report.html")
+    if os.path.isfile(html_p):
+        r["_html_report"] = html_p
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1030,8 +1059,9 @@ def main():
                     help="Dry run: scan repos and estimate AI cost without calling the API")
     ai.add_argument("--no-validate", action="store_true",
                     help="Skip AI validation of findings (validation runs by default)")
-    ai.add_argument("--refresh-ai", "--rai", action="store_true", dest="refresh_ai",
-                    help="Ignore any cached AI review and re-run the AI analysis")
+    ai.add_argument("--refresh", "--refresh-all", action="store_true", dest="refresh",
+                    help="Ignore all caches and re-run everything (analyzers + AI). "
+                         "By default, existing analyzer reports and the AI review are reused.")
     ai.add_argument("--cost-threshold", type=float, default=5.0, metavar="$",
                     help="Auto-confirm validation if the TOTAL estimated validation "
                          "cost across all repos is below this threshold in USD "
@@ -1131,7 +1161,10 @@ def main():
                     results.append({"name": repo_name, "prompt_chars": chars})
                     print(f"[MCPROBE] Using existing analysis for {repo_name}")
                 else:
-                    print(f"[MCPROBE] MCP Server already analyzed - {analysis_root}")
+                    # Load the cached analysis so it still shows up in the
+                    # summary / findings / dashboard (don't drop it).
+                    results.append(_load_cached_result(repo_name, analysis_root))
+                    print(f"[MCPROBE] Using cached analysis - {repo_name}")
                 continue
         urls_to_scan.append(url)
 
@@ -1145,6 +1178,12 @@ def main():
                 final["_html_report"] = generate_html_report(final)
             except Exception as e:
                 print(f"[MCPROBE] HTML report failed: {e}")
+            # Persist analyzer counts so a later run can reuse them (unless --refresh).
+            if not final.get("use_cached_analysis"):
+                try:
+                    write_analysis_meta(final)
+                except Exception:
+                    pass
         return final
 
     if num_threads > 1 and len(urls_to_scan) > 1:
@@ -1216,7 +1255,10 @@ def main():
     if do_validate:
         from analyzers.ai.validate import estimate_validate_cost, run_validate
         _model = _resolve_model_name(args, api_config)
-        ok_results = [r for r in results if "_error" not in r]
+        # Skip repos served entirely from cache — their validation_result.json
+        # on disk is reused as-is (re-run with --refresh to re-validate).
+        ok_results = [r for r in results
+                      if "_error" not in r and not r.get("use_cached_analysis")]
         per_repo = [(r.get("name", "?"),
                      estimate_validate_cost(r.get("validate_chars", 0), _model))
                     for r in ok_results]

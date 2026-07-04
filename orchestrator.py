@@ -129,7 +129,8 @@ class State(TypedDict):
     ai_model: str               # model name override (empty = use default)
     calc_cost: bool             # dry-run: measure prompt size, skip API call
     ai_only: bool               # --ai-only: analyzers skipped, don't announce them
-    refresh_ai: bool            # --refresh-ai: ignore any cached AI review, re-run it
+    refresh: bool               # --refresh: ignore all caches, re-run analyzers + AI
+    use_cached_analysis: bool   # runtime flag: reusing cached analyzer reports
     tokens_in: int              # cumulative AI input tokens (review + validation)
     tokens_out: int             # cumulative AI output tokens (review + validation)
     validate_tokens_in: int     # input tokens used by the validation pass only
@@ -212,16 +213,78 @@ def detect_language_node(state: State) -> State:
     return state
 
 
+_CACHED_REPORTS = ("mcp_flow_analysis.txt", "network_analysis.txt", "sse_analysis.txt",
+                   "auth_analysis.txt", "bandit_analysis.txt", "semgrep_analysis.txt")
+_ANALYSIS_META = "analysis_meta.json"
+_META_KEYS = ("language", "cfg_issues", "mcp_tool_count", "net_issues", "sse_issues",
+              "auth_issues", "bandit_high", "semgrep_issues", "needs_oversight")
+
+
+def load_analysis_meta(analysis_root: str):
+    """Return cached analyzer counts for a repo, or None if there's no valid
+    cache (requires both the meta file and the flow report to exist)."""
+    if not analysis_root:
+        return None
+    meta_p = os.path.join(analysis_root, _ANALYSIS_META)
+    flow_p = os.path.join(analysis_root, "mcp_flow_analysis.txt")
+    if not (os.path.isfile(meta_p) and os.path.isfile(flow_p)):
+        return None
+    try:
+        with open(meta_p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_analysis_meta(state: dict):
+    """Persist analyzer counts so a later run can reuse them (unless --refresh)."""
+    root = state.get("analysis_root", "")
+    if not root:
+        return
+    try:
+        os.makedirs(root, exist_ok=True)
+        meta = {k: state.get(k) for k in _META_KEYS}
+        with open(os.path.join(root, _ANALYSIS_META), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+
 def analyze_repo_code(state: State) -> State:
     if not state.get("enabled_modules", {}).get("cfg", True):
         if not state.get("ai_only"):
             dprint("[CFG] Module disabled — skipping")
         return state
+
+    repo_path = state["repo_local_path"]
+    analysis_root = state["analysis_root"]
+
+    # Cache: reuse prior analyzer outputs unless --refresh. This is the first
+    # analyzer node, so setting use_cached_analysis here makes every later
+    # analyzer node short-circuit (see _timeout_wrapper).
+    if not state.get("refresh"):
+        meta = load_analysis_meta(analysis_root)
+        if meta:
+            for k, v in meta.items():
+                if v is not None:
+                    state[k] = v
+            state["use_cached_analysis"] = True
+            state["code_analysis_path"] = os.path.join(analysis_root, "mcp_flow_analysis.txt")
+            # Repopulate interesting_files from the cached reports so validation
+            # still has source context.
+            if state.get("validate"):
+                files = []
+                for fname in _CACHED_REPORTS:
+                    files += extract_files_from_report(
+                        os.path.join(analysis_root, fname), repo_path)
+                state["interesting_files"] = list(dict.fromkeys(files))
+            dprint(f"[CACHE] Reusing analyzer outputs for {state['name']} "
+                   "— use --refresh to re-run")
+            return state
+
     dprint("[CFG] Running MCP flow analyzer")
     from analyzers.code_analyzer import analyze_repo_path
     from analyzers.mcp_flow_analyzer import analyze_mcp_flow, has_mcp_tool_signal
-    repo_path = state["repo_local_path"]
-    analysis_root = state["analysis_root"]
     os.makedirs(analysis_root, exist_ok=True)
     analyze_repo_path(repo_path, repo_name=state["name"], output_dir=analysis_root)
     mcp_report_path, cfg_count, tool_count = analyze_mcp_flow(repo_path, state["name"], analysis_root)
@@ -435,7 +498,7 @@ def use_ai(state: State) -> State:
         is_bad = (not cached) or any(m in low for m in (
             "analysis failed", "scan failed", "skipped:", "offline mode:",
             "ai review disabled", "unknown ai backend"))
-        if cached and not is_bad and not state.get("refresh_ai"):
+        if cached and not is_bad and not state.get("refresh"):
             state["ai_analysis"] = cached
             dprint(f"[AI] Using existing review for {repo_name}")
             if state.get("calc_cost", False):
@@ -444,8 +507,8 @@ def use_ai(state: State) -> State:
                 from analyzers.ai.validate import estimate_validate_chars
                 state["validate_chars"] = estimate_validate_chars(state)
             return state
-        if cached and state.get("refresh_ai"):
-            dprint(f"[AI] --refresh-ai — ignoring cached review for {repo_name}, re-running")
+        if cached and state.get("refresh"):
+            dprint(f"[AI] --refresh — ignoring cached review for {repo_name}, re-running")
         elif cached:
             dprint(f"[AI] Cached review for {repo_name} was a failure/placeholder — re-running")
 
@@ -689,9 +752,9 @@ def _timeout_wrapper(func, label):
     node is skipped and the original state is returned unchanged.
     """
     def wrapper(state):
-        # Halt: once a repo is flagged for manual oversight (no MCP tools),
-        # skip every remaining analyzer node.
-        if state.get("needs_oversight"):
+        # Skip remaining analyzers when the repo is flagged for manual oversight
+        # (no MCP tools) or when reusing cached analyzer outputs.
+        if state.get("needs_oversight") or state.get("use_cached_analysis"):
             return state
         timeout = state.get("module_timeout", 0)
         if not timeout:
@@ -781,7 +844,8 @@ def _default_state_extras() -> dict:
         "ai_model": "",
         "calc_cost": False,
         "ai_only": False,
-        "refresh_ai": False,
+        "refresh": False,
+        "use_cached_analysis": False,
         "tokens_in": 0,
         "tokens_out": 0,
         "validate_tokens_in": 0,
