@@ -82,6 +82,41 @@ def should_skip_path(path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Language detection
+# ---------------------------------------------------------------------------
+
+# Extension -> language. Python and JS/TS keep the "python"/"js" values the
+# analyzer routing already keys on; everything else is for display only (it
+# helps explain why a repo needs manual oversight, e.g. a Go or Java server).
+_LANG_EXT = {
+    ".py": "python",
+    ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+    ".ts": "js", ".tsx": "js", ".mts": "js",
+    ".go": "go", ".java": "java", ".cs": "c#", ".rs": "rust",
+    ".rb": "ruby", ".php": "php", ".kt": "kotlin", ".swift": "swift",
+    ".cpp": "c++", ".cc": "c++", ".cxx": "c++", ".c": "c",
+}
+
+
+def guess_language(repo_path: str) -> str:
+    """Return the repo's dominant language by source-file extension. Returns
+    'python'/'js' for the analyzable languages (routing keys on these) and
+    richer names (go, java, c#, ...) for the rest, or 'unknown'."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return "unknown"
+    counts: dict = {}
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d.lower() not in EXCLUDE_DIRS]
+        for f in files:
+            lang = _LANG_EXT.get(os.path.splitext(f)[1].lower())
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+    if not counts:
+        return "unknown"
+    return max(counts, key=counts.get)
+
+
+# ---------------------------------------------------------------------------
 # AI output parsing
 # ---------------------------------------------------------------------------
 
@@ -456,8 +491,8 @@ function renderList(){
     const meta = [];
     if(r.error){ meta.push(`<span class="tag err">ERROR</span>`); }
     else {
-      if(r.oversight) meta.push(`<span class="tag oversight">MANUAL OVERSIGHT</span>`);
-      meta.push(`<span class="tag">${esc(r.lang||"?")}</span>`);
+      if(r.oversight) meta.push(`<span class="tag oversight">MANUAL OVERSIGHT · ${esc(r.lang||"?")}</span>`);
+      else meta.push(`<span class="tag">${esc(r.lang||"?")}</span>`);
       if(r.high!=null) meta.push(`<span class="tag">${r.high} high / ${r.total} total</span>`);
       if(r.stats) meta.push(`<span class="tag">${esc(r.stats)}</span>`);
       meta.push(`<span class="tag">AI ${r.ai?"✓":"—"}</span>`);

@@ -941,9 +941,9 @@ def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
     findings, and dashboard. Counts/language/oversight come from
     analysis_meta.json when present, otherwise they're derived from the reports
     (older analysis folders predate the meta file)."""
-    from orchestrator import load_analysis_meta, detect_language
+    from orchestrator import load_analysis_meta
     from analyzers.mcp_flow_analyzer import has_mcp_tool_signal
-    from helpers import parse_analyzer_findings
+    from helpers import parse_analyzer_findings, guess_language
     repo_local = os.path.join(os.getcwd(), "out", "all_repos", repo_name)
     r = {
         "name": repo_name,
@@ -984,7 +984,7 @@ def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
         r["bandit_high"]    = by_mod.get("bandit", 0)
         r["semgrep_issues"] = by_mod.get("semgrep", 0)
         if "language" not in r:
-            r["language"] = detect_language(repo_local)
+            r["language"] = guess_language(repo_local)
 
     # Derive the manual-oversight flag if the meta didn't record it.
     if "needs_oversight" not in r:

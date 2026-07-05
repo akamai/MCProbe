@@ -7,7 +7,8 @@ import threading
 from typing import Optional, Dict as TypingDict, List
 
 from typing_extensions import TypedDict
-from helpers import dprint, extract_files_from_report, estimate_prompt_chars_from_folder, usage_tokens
+from helpers import (dprint, extract_files_from_report, estimate_prompt_chars_from_folder,
+                     usage_tokens, guess_language)
 
 
 def _silence_sdk_loggers():
@@ -191,26 +192,8 @@ def clone_repo_node(state: State) -> State:
     return state
 
 
-def detect_language(repo_path: str) -> str:
-    """Primary language of a repo, by .py vs .js/.ts file counts."""
-    py_files = js_files = 0
-    exclude = {"node_modules", "venv", ".venv"}
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in exclude]
-        for f in files:
-            if f.endswith(".py"):
-                py_files += 1
-            elif f.endswith((".js", ".ts", ".jsx", ".tsx")):
-                js_files += 1
-    if js_files > py_files:
-        return "js"
-    if py_files > js_files:
-        return "python"
-    return "unknown"
-
-
 def detect_language_node(state: State) -> State:
-    lang = detect_language(state["repo_local_path"])
+    lang = guess_language(state["repo_local_path"])
     state["language"] = lang
     dprint(f"[MCPROBE] {state['name']} detected as {lang}")
     return state
