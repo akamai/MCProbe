@@ -571,8 +571,14 @@ renderStats(); renderPills(); renderList(); applyFilters();
 
 
 def render_batch_html(payload: dict) -> str:
-    """Render the interactive batch dashboard from a prepared payload."""
-    return _BATCH_HTML.replace("__DATA__", json.dumps(payload, ensure_ascii=False))
+    """Render the interactive batch dashboard from a prepared payload.
+
+    Escape '<' so a source snippet containing '</script>' can't close the
+    embedded <script> tag and break the page. ensure_ascii=True also escapes
+    U+2028/U+2029 (JS line separators) that would otherwise break the literal.
+    """
+    data = json.dumps(payload).replace("<", "\\u003c")
+    return _BATCH_HTML.replace("__DATA__", data)
 
 
 # ---------------------------------------------------------------------------
