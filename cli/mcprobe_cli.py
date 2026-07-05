@@ -15,6 +15,7 @@ import signal
 import sys
 import time
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import dotenv_values
@@ -937,12 +938,17 @@ def _open_path(path: str):
 def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
     """Build a result dict for an already-analyzed repo straight from its
     on-disk analysis, so --skip-analyzed repos still appear in the summary,
-    findings, and dashboard instead of vanishing from the output."""
-    from orchestrator import load_analysis_meta
+    findings, and dashboard. Counts/language/oversight come from
+    analysis_meta.json when present, otherwise they're derived from the reports
+    (older analysis folders predate the meta file)."""
+    from orchestrator import load_analysis_meta, detect_language
+    from analyzers.mcp_flow_analyzer import has_mcp_tool_signal
+    from helpers import parse_analyzer_findings
+    repo_local = os.path.join(os.getcwd(), "out", "all_repos", repo_name)
     r = {
         "name": repo_name,
         "analysis_root": analysis_root,
-        "repo_local_path": os.path.join(os.getcwd(), "out", "all_repos", repo_name),
+        "repo_local_path": repo_local,
         "use_cached_analysis": True,
     }
     meta = load_analysis_meta(analysis_root) or {}
@@ -950,6 +956,7 @@ def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
               "auth_issues", "bandit_high", "semgrep_issues", "needs_oversight"):
         if meta.get(k) is not None:
             r[k] = meta[k]
+
     ai_p = os.path.join(analysis_root, "ai_security_review.json")
     if os.path.isfile(ai_p):
         try:
@@ -960,6 +967,39 @@ def _load_cached_result(repo_name: str, analysis_root: str) -> dict:
     html_p = os.path.join(analysis_root, "report.html")
     if os.path.isfile(html_p):
         r["_html_report"] = html_p
+    for key, fname in (("bandit_analysis_path", "bandit_analysis.txt"),
+                       ("semgrep_analysis_path", "semgrep_analysis.txt")):
+        p = os.path.join(analysis_root, fname)
+        if os.path.isfile(p):
+            r[key] = p
+
+    # No meta (older folder) → derive counts / language from the reports.
+    if "cfg_issues" not in r:
+        findings = parse_analyzer_findings(r)
+        by_mod = Counter(f.get("module") for f in findings)
+        r["cfg_issues"]     = by_mod.get("flow", 0)
+        r["net_issues"]     = by_mod.get("network", 0)
+        r["auth_issues"]    = by_mod.get("auth", 0)
+        r["sse_issues"]     = by_mod.get("sse", 0)
+        r["bandit_high"]    = by_mod.get("bandit", 0)
+        r["semgrep_issues"] = by_mod.get("semgrep", 0)
+        if "language" not in r:
+            r["language"] = detect_language(repo_local)
+
+    # Derive the manual-oversight flag if the meta didn't record it.
+    if "needs_oversight" not in r:
+        flow_p = os.path.join(analysis_root, "mcp_flow_analysis.txt")
+        flow_txt = ""
+        if os.path.isfile(flow_p):
+            try:
+                with open(flow_p, "r", encoding="utf-8", errors="replace") as f:
+                    flow_txt = f.read()
+            except Exception:
+                pass
+        if "No MCP tool entry points detected" in flow_txt:
+            r["needs_oversight"] = not has_mcp_tool_signal(repo_local)
+        else:
+            r["needs_oversight"] = False
     return r
 
 
@@ -1322,6 +1362,16 @@ def main():
                         progress.finish()
             finally:
                 _h.dprint = _orig_dprint
+
+    # Health check before the table: how many repos need manual oversight
+    # (no MCP tools detected). A high count — especially among JS repos —
+    # usually means tool detection missed them.
+    oversight = [r for r in results if r.get("needs_oversight")]
+    if oversight:
+        js_ov = sum(1 for r in oversight if (r.get("language") or "") in ("js", "javascript", "ts", "typescript"))
+        print(f"\n[MCPROBE] ⚠ {len(oversight)} of {len(results)} repo(s) need MANUAL OVERSIGHT "
+              f"(no MCP tools detected{f'; {js_ov} are JS/TS' if js_ov else ''}). "
+              "Review these — likely non-Python/JS, or unrecognized tool registration.")
 
     large_batch = is_batch and len(results) > 10
 

@@ -191,8 +191,8 @@ def clone_repo_node(state: State) -> State:
     return state
 
 
-def detect_language_node(state: State) -> State:
-    repo_path = state["repo_local_path"]
+def detect_language(repo_path: str) -> str:
+    """Primary language of a repo, by .py vs .js/.ts file counts."""
     py_files = js_files = 0
     exclude = {"node_modules", "venv", ".venv"}
     for root, dirs, files in os.walk(repo_path):
@@ -203,11 +203,14 @@ def detect_language_node(state: State) -> State:
             elif f.endswith((".js", ".ts", ".jsx", ".tsx")):
                 js_files += 1
     if js_files > py_files:
-        lang = "js"
-    elif py_files > js_files:
-        lang = "python"
-    else:
-        lang = "unknown"
+        return "js"
+    if py_files > js_files:
+        return "python"
+    return "unknown"
+
+
+def detect_language_node(state: State) -> State:
+    lang = detect_language(state["repo_local_path"])
     state["language"] = lang
     dprint(f"[MCPROBE] {state['name']} detected as {lang}")
     return state
