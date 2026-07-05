@@ -498,7 +498,7 @@ function renderList(){
       meta.push(`<span class="tag">AI ${r.ai?"✓":"—"}</span>`);
     }
     return `
-    <div class="repo" data-idx="${i}" data-name="${esc(r.name.toLowerCase())}" data-flag="${(r.error||r.oversight)?1:0}">
+    <div class="repo" data-idx="${i}" data-name="${esc(r.name.toLowerCase())}">
       <div class="repo-head">
         <input type="checkbox" class="repo-cb" checked data-idx="${i}">
         <span class="repo-name">${repoLink(r)}</span>
@@ -541,8 +541,9 @@ function applyFilters(){
     });
     const nameMatch = !q || el.dataset.name.includes(q);
     let show = cb.checked && nameMatch;
-    // Keep flagged repos (errors / manual-oversight) visible even with no findings.
-    if(hideEmpty && shown === 0 && el.dataset.flag !== "1") show = false;
+    // Repos with no shown findings — including manual-oversight and error repos
+    // — are hidden while "hide empty" is on. Uncheck it to reveal them.
+    if(hideEmpty && shown === 0) show = false;
     el.classList.toggle("hidden", !show);
     if(show) visible++;
   });
